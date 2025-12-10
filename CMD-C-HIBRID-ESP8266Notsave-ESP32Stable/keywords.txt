@@ -1,0 +1,44 @@
+#######################################
+# Syntax Coloring Map For CMD-C
+#######################################
+
+#######################################
+# Datatypes (KEYWORD1)
+#######################################
+
+CMDCore	KEYWORD1
+CMDWiFi	KEYWORD1
+CMDWebServer	KEYWORD1
+
+#######################################
+# Methods and Functions (KEYWORD2)
+#######################################
+
+begin	KEYWORD2
+handle	KEYWORD2
+addRoute	KEYWORD2
+isConnected	KEYWORD2
+getSSID	KEYWORD2
+getIP	KEYWORD2
+getRSSI	KEYWORD2
+isAPMode	KEYWORD2
+getMacAddress	KEYWORD2
+getVersion	KEYWORD2
+getUptime	KEYWORD2
+clearBootCountAfterStableRun	KEYWORD2
+loadCredentials	KEYWORD2
+saveCredentials	KEYWORD2
+forgetCredentials	KEYWORD2
+hasCredentials	KEYWORD2
+startAP	KEYWORD2
+connectSTA	KEYWORD2
+
+#######################################
+# Constants (LITERAL1)
+#######################################
+
+CMD_VERSION	LITERAL1
+CMD_AP_PASSWORD	LITERAL1
+CMD_BOOT_COUNT_THRESHOLD	LITERAL1
+CMD_BOOT_WINDOW_MS	LITERAL1
+CMD_PREFS_NAMESPACE	LITERAL1
