@@ -5,6 +5,7 @@
 #include <PubSubClient.h>
 #include <ETH.h>
 #include <ArduinoJson.h>
+#include <CMDCore.h>
 #include "Config.h"
 #include "IOManager.h"
 
@@ -12,65 +13,63 @@ class MqttHandler {
 public:
     MqttHandler(IOManager* ioMgr);
 
-    void begin(const char* broker, uint16_t port,
-               const char* user, const char* pass,
-               const char* deviceName);
+    // Inicializa usando a configuração MQTT salva pelo CMD-C (/mqtt page)
+    // Se não houver config no CMD-C, usa broker/port/user/pass hardcoded em fallback
+    void begin(CMDCore* corePtr,
+               const char* fallbackBroker = "",
+               uint16_t    fallbackPort   = 1883,
+               const char* fallbackUser   = "",
+               const char* fallbackPass   = "");
 
     void handle();
 
-    // Publica estado de uma saída (chamado pelo IOManager via callback)
+    // Publicações (chamadas pelos callbacks do IOManager)
     void publishOutputState(uint8_t index, bool state);
-
-    // Publica estado de uma entrada
     void publishInputState(uint8_t index, bool state);
-
-    // Publica telemetria completa
     void publishTelemetry();
 
-    bool isConnected();
-
-    void setTelemetryInterval(uint32_t ms);
-    uint32_t getTelemetryInterval();
-
-    // Nome do dispositivo (topic base)
-    String getDeviceName();
-    void setDeviceName(const String& name);
+    bool     isConnected();
+    String   getDeviceName()             { return deviceName; }
+    void     setDeviceName(const String& name) { deviceName = name; }
+    void     setTelemetryInterval(uint32_t ms);
+    uint32_t getTelemetryInterval()      { return telemetryInterval; }
 
 private:
-    IOManager* io;
-    WiFiClient ethClient;
+    IOManager*   io;
+    CMDCore*     core;
+    WiFiClient   ethClient;       // WiFiClient funciona sobre ETH no ESP32
     PubSubClient mqttClient;
 
-    String deviceName;
-    String broker;
+    // Configuração MQTT (carregada do CMDCore ou fallback)
+    String   broker;
     uint16_t port;
-    String mqttUser;
-    String mqttPass;
+    String   mqttUser;
+    String   mqttPass;
+    String   deviceName;          // nome do dispositivo = base do tópico Tasmota
 
-    uint32_t telemetryInterval;
+    uint32_t      telemetryInterval;
     unsigned long lastTelemetryTime;
     unsigned long lastReconnectAttempt;
 
-    // Tópicos Tasmota
-    // cmnd/ETH-18CH-MASTER/POWER1  → controla saída 1
-    // stat/ETH-18CH-MASTER/POWER1  → estado saída 1
-    // tele/ETH-18CH-MASTER/SENSOR  → telemetria
-
-    String cmdTopic(const String& cmd);   // cmnd/<device>/<cmd>
-    String statTopic(const String& key);  // stat/<device>/<key>
-    String teleTopic(const String& key);  // tele/<device>/<key>
+    // Carrega config do CMDMqtt (se disponível) ou usa fallback
+    void loadConfig(const char* fallbackBroker, uint16_t fallbackPort,
+                    const char* fallbackUser,   const char* fallbackPass);
 
     void reconnect();
     void subscribe();
 
+    // Helpers de tópico (formato Tasmota)
+    String cmdTopic (const String& cmd);   // cmnd/<device>/<cmd>
+    String statTopic(const String& key);   // stat/<device>/<key>
+    String teleTopic(const String& key);   // tele/<device>/<key>
+
+    // Callback MQTT (padrão PubSubClient — ponteiro estático)
     static void messageCallback(char* topic, byte* payload, unsigned int length);
     void handleMessage(const String& topic, const String& payload);
-
-    // Parse de comandos Tasmota
     void handlePowerCommand(uint8_t outputIndex, const String& payload);
     void handleAllPowerCommand(const String& payload);
 
-    static MqttHandler* instance; // para callback estático
+    static MqttHandler* instance;
 };
 
 #endif // MQTT_HANDLER_ETH18_H

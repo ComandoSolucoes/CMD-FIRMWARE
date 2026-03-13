@@ -1,4 +1,5 @@
 #include "I2CSlaveManager.h"
+// LOG_WARNF já está definido em Config.h (incluído via I2CSlaveManager.h)
 
 I2CSlaveManager::I2CSlaveManager()
     : lastPollTime(0), inputChangedCb(nullptr) {
@@ -23,7 +24,6 @@ void I2CSlaveManager::begin() {
     Wire.begin();
     Wire.setClock(I2C_FREQ);
 
-    // Verifica quais escravos estão presentes
     for (uint8_t s = 0; s < NUM_SLAVES; s++) {
         Wire.beginTransmission(slaveAddresses[s]);
         uint8_t err = Wire.endTransmission(true);
@@ -50,12 +50,9 @@ void I2CSlaveManager::handle() {
     }
 }
 
-// ==================== CONTROLE DE SAÍDAS ====================
-
 void I2CSlaveManager::setOutput(uint8_t slaveIndex, uint8_t outputIndex, bool state) {
     if (slaveIndex >= NUM_SLAVES || outputIndex >= NUM_SLAVE_CHANNELS) return;
     slaveData[slaveIndex].outputs[outputIndex] = state;
-    // A mudança será enviada no próximo ciclo handle()
 }
 
 bool I2CSlaveManager::getOutput(uint8_t slaveIndex, uint8_t outputIndex) {
@@ -63,14 +60,10 @@ bool I2CSlaveManager::getOutput(uint8_t slaveIndex, uint8_t outputIndex) {
     return slaveData[slaveIndex].outputs[outputIndex];
 }
 
-// ==================== LEITURA DE ENTRADAS ====================
-
 bool I2CSlaveManager::getInput(uint8_t slaveIndex, uint8_t inputIndex) {
     if (slaveIndex >= NUM_SLAVES || inputIndex >= NUM_SLAVE_CHANNELS) return false;
     return slaveData[slaveIndex].inputs[inputIndex];
 }
-
-// ==================== STATUS ====================
 
 bool I2CSlaveManager::isSlaveOnline(uint8_t slaveIndex) {
     if (slaveIndex >= NUM_SLAVES) return false;
@@ -82,22 +75,16 @@ SlaveStatus I2CSlaveManager::getSlaveStatus(uint8_t slaveIndex) {
     return slaveStatus[slaveIndex];
 }
 
-// ==================== CALLBACK ====================
-
 void I2CSlaveManager::setInputChangedCallback(SlaveInputChangedCallback cb) {
     inputChangedCb = cb;
 }
 
-// ==================== COMUNICAÇÃO INTERNA ====================
-
 bool I2CSlaveManager::communicateWithSlave(uint8_t slaveIndex) {
-    // Salva inputs anteriores para detectar mudanças
     bool previousInputs[NUM_SLAVE_CHANNELS];
     for (uint8_t i = 0; i < NUM_SLAVE_CHANNELS; i++) {
         previousInputs[i] = slaveData[slaveIndex].inputs[i];
     }
 
-    // 1) Envia outputs
     if (!sendOutputsJson(slaveIndex)) {
         slaveStatus[slaveIndex].errorCount++;
         slaveStatus[slaveIndex].totalErrors++;
@@ -110,14 +97,12 @@ bool I2CSlaveManager::communicateWithSlave(uint8_t slaveIndex) {
         return false;
     }
 
-    // 2) Recebe inputs
     if (!receiveInputsJson(slaveIndex)) {
         slaveStatus[slaveIndex].errorCount++;
         slaveStatus[slaveIndex].totalErrors++;
         return false;
     }
 
-    // Comunicação OK
     if (!slaveStatus[slaveIndex].online) {
         LOG_INFOF("Escravo %d voltou online!", slaveIndex + 1);
     }
@@ -125,16 +110,13 @@ bool I2CSlaveManager::communicateWithSlave(uint8_t slaveIndex) {
     slaveStatus[slaveIndex].lastContact = millis();
     slaveStatus[slaveIndex].errorCount  = 0;
 
-    // Detecta mudanças nas entradas
     detectInputChanges(slaveIndex, previousInputs);
-
     return true;
 }
 
 bool I2CSlaveManager::sendOutputsJson(uint8_t slaveIndex) {
     StaticJsonDocument<300> doc;
 
-    // Monta JSON com os 8 outputs: {"do1":0,"do2":1,...,"do8":0}
     for (uint8_t i = 0; i < NUM_SLAVE_CHANNELS; i++) {
         String key = "do" + String(i + 1);
         doc[key] = slaveData[slaveIndex].outputs[i] ? 1 : 0;
@@ -151,7 +133,6 @@ bool I2CSlaveManager::sendOutputsJson(uint8_t slaveIndex) {
 }
 
 bool I2CSlaveManager::receiveInputsJson(uint8_t slaveIndex) {
-    // Solicita até 128 bytes do escravo
     uint8_t bytesReceived = Wire.requestFrom(slaveAddresses[slaveIndex], (uint8_t)128);
 
     if (!bytesReceived) return false;
@@ -164,7 +145,6 @@ bool I2CSlaveManager::receiveInputsJson(uint8_t slaveIndex) {
 
     if (data.length() == 0) return false;
 
-    // Parse JSON: {"di1":0,"di2":1,...,"di8":0}
     StaticJsonDocument<300> doc;
     DeserializationError err = deserializeJson(doc, data);
     if (err) {
@@ -191,8 +171,3 @@ void I2CSlaveManager::detectInputChanges(uint8_t slaveIndex, bool previousInputs
         }
     }
 }
-
-// Macro de warn com formato (não estava no Config.h)
-#ifndef LOG_WARNF
-#define LOG_WARNF(fmt, ...) Serial.printf(LOG_PREFIX "⚠️ " fmt "\n", ##__VA_ARGS__)
-#endif

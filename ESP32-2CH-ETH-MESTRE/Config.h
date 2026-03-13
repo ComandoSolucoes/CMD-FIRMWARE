@@ -17,44 +17,45 @@
 #define ETH_CLK_MODE    ETH_CLOCK_GPIO0_IN
 
 // ==================== I2C (BARRAMENTO) ====================
-#define I2C_SDA_PIN     4      // Pino SDA (igual ao exemplo do fornecedor)
-#define I2C_SCL_PIN     2      // Pino SCL (igual ao exemplo do fornecedor)
+#define I2C_SDA_PIN     4      // Pino SDA — confirmado no código do fornecedor
+#define I2C_SCL_PIN     2      // Pino SCL — confirmado no código do fornecedor
 #define I2C_FREQ        100000 // 100 kHz
 
-// Endereços I2C dos escravos 8CH
-#define I2C_SLAVE1_ADDR 0x08   // Escravo 1 — altere conforme seu hardware
-#define I2C_SLAVE2_ADDR 0x09   // Escravo 2 — altere conforme seu hardware
+// Endereços I2C dos escravos 8CH — confirmado no código do fornecedor
+#define I2C_SLAVE1_ADDR 0x55
+#define I2C_SLAVE2_ADDR 0x56
 
-// Timeout de comunicação I2C (ms)
+// Timeout e intervalo de polling I2C (ms)
 #define I2C_TIMEOUT_MS  50
-// Intervalo entre ciclos de polling I2C (ms)
 #define I2C_POLL_MS     20
 
 // ==================== PINOS LOCAIS (MASTER) ====================
-// Saídas locais (2 relés no próprio master)
-#define LOCAL_OUTPUT_1_PIN  14  // GPIO14
-#define LOCAL_OUTPUT_2_PIN  15  // GPIO15
+// Apenas 2 saídas locais — confirmado no código do fornecedor (rele1=14, rele2=12)
+// OutC03/OutC04 não são usados como relés livres
+#define LOCAL_OUTPUT_1_PIN  14  // GPIO14 — rele1
+#define LOCAL_OUTPUT_2_PIN  12  // GPIO12 — rele2
 
-// Entradas locais (2 entradas digitais no próprio master)
-#define LOCAL_INPUT_1_PIN   34  // GPIO34 (somente entrada)
-#define LOCAL_INPUT_2_PIN   35  // GPIO35 (somente entrada)
+// Entradas locais via optoacopladores (INPUT_ONLY GPIOs)
+#define LOCAL_INPUT_1_PIN   39  // GPIO39 — InC01
+#define LOCAL_INPUT_2_PIN   36  // GPIO36 — InC02
 
 // ==================== CANAIS TOTAIS ====================
+// 2 locais + 2 escravos × 8 canais = 18 CH
 #define NUM_LOCAL_OUTPUTS   2
 #define NUM_LOCAL_INPUTS    2
-#define NUM_SLAVE_CHANNELS  8   // Canais por escravo (8 in + 8 out)
+#define NUM_SLAVE_CHANNELS  8   // 8 canais por escravo (8CH)
 #define NUM_SLAVES          2
 #define NUM_TOTAL_OUTPUTS   (NUM_LOCAL_OUTPUTS + NUM_SLAVES * NUM_SLAVE_CHANNELS)  // 18
 #define NUM_TOTAL_INPUTS    (NUM_LOCAL_INPUTS  + NUM_SLAVES * NUM_SLAVE_CHANNELS)  // 18
 
 // ==================== MAPEAMENTO DE CANAIS ====================
-// Saídas:  1-2   → locais
-//          3-10  → escravo 1 (do1-do8)
-//          11-18 → escravo 2 (do1-do8)
+// Saídas:   0-1   → locais  (rele1, rele2)
+//           2-9   → escravo 1 — 0x55 (do1–do8)
+//           10-17 → escravo 2 — 0x56 (do1–do8)
 //
-// Entradas: 1-2   → locais
-//           3-10  → escravo 1 (di1-di8)
-//           11-18 → escravo 2 (di1-di8)
+// Entradas: 0-1   → locais  (InC01, InC02)
+//           2-9   → escravo 1 — 0x55 (di1–di8)
+//           10-17 → escravo 2 — 0x56 (di1–di8)
 
 // ==================== CONFIGURAÇÕES DE ENTRADA ====================
 enum InputMode {
@@ -89,11 +90,6 @@ enum InitialState {
 #define MIN_TELEMETRY_INTERVAL      5000    // 5 s
 #define MAX_TELEMETRY_INTERVAL      300000  // 5 min
 
-// Prefixos Tasmota
-#define MQTT_CMD_PREFIX   "cmd-c/"
-#define MQTT_STAT_PREFIX  "stat/cmd-c/"
-#define MQTT_TELE_PREFIX  "tele/cmd-c/"
-
 // ==================== PREFERENCES (NVS) ====================
 #define PREFS_NAMESPACE          "eth18ch"
 #define PREFS_RELAY_LOGIC        "relay_logic"
@@ -104,6 +100,9 @@ enum InitialState {
 #define PREFS_PULSE_PREFIX       "pulse_"
 #define PREFS_TELE_INTERVAL      "tele_interval"
 
+// ==================== WATCHDOG ====================
+#define WATCHDOG_TIMEOUT_SEC    30
+
 // ==================== LOGS ====================
 #define LOG_PREFIX "[ETH-18CH] "
 #define LOG_INFO(msg)        Serial.println(LOG_PREFIX msg)
@@ -111,5 +110,6 @@ enum InitialState {
 #define LOG_ERROR(msg)       Serial.println(LOG_PREFIX "❌ " msg)
 #define LOG_ERRORF(fmt, ...) Serial.printf(LOG_PREFIX "❌ " fmt "\n", ##__VA_ARGS__)
 #define LOG_WARN(msg)        Serial.println(LOG_PREFIX "⚠️ " msg)
+#define LOG_WARNF(fmt, ...)  Serial.printf(LOG_PREFIX "⚠️ " fmt "\n", ##__VA_ARGS__)
 
 #endif // CONFIG_ETH18CH_H

@@ -1,51 +1,75 @@
 #include "IOManager.h"
 
+// ==================== PINOS LOCAIS (do Config.h) ====================
+
+const uint8_t IOManager::OUTPUT_PINS[NUM_LOCAL_OUTPUTS] = {
+    LOCAL_OUTPUT_1_PIN,   // GPIO14 — rele1
+    LOCAL_OUTPUT_2_PIN    // GPIO12 — rele2
+};
+
+const uint8_t IOManager::INPUT_PINS[NUM_LOCAL_INPUTS] = {
+    LOCAL_INPUT_1_PIN,    // GPIO39 — InC01
+    LOCAL_INPUT_2_PIN     // GPIO36 — InC02
+};
+
+// ==================== CONSTRUTOR ====================
+
 IOManager::IOManager(I2CSlaveManager* slaveMgr)
     : slaves(slaveMgr),
       relayLogic(RELAY_LOGIC_NORMAL),
-      initialState(INITIAL_STATE_OFF),
-      outputChangedCb(nullptr),
-      inputChangedCb(nullptr) {
+      initialState(INITIAL_STATE_OFF)
+{
+    memset(outputStates,  0, sizeof(outputStates));
+    memset(inputStates,   0, sizeof(inputStates));
+    memset(lastInputRaw,  0, sizeof(lastInputRaw));
+    memset(debounceTimer, 0, sizeof(debounceTimer));
+    memset(pulseTimer,    0, sizeof(pulseTimer));
 
+    for (uint8_t i = 0; i < NUM_TOTAL_INPUTS;  i++) {
+        inputMode  [i] = INPUT_MODE_DISABLED;
+        debounceMs [i] = DEFAULT_DEBOUNCE_MS;
+    }
     for (uint8_t i = 0; i < NUM_LOCAL_OUTPUTS; i++) {
-        localOutputStates[i] = false;
-    }
-    for (uint8_t i = 0; i < NUM_LOCAL_INPUTS; i++) {
-        localInputStates[i]      = false;
-        lastLocalInputStates[i]  = false;
-        lastLocalDebounceTime[i] = 0;
-    }
-    for (uint8_t i = 0; i < NUM_TOTAL_OUTPUTS; i++) {
-        pulseActive[i]    = false;
-        pulseStartTime[i] = 0;
-    }
-    for (uint8_t i = 0; i < NUM_TOTAL_INPUTS; i++) {
-        inputModes[i]    = INPUT_MODE_DISABLED;
-        debounceTimes[i] = DEFAULT_DEBOUNCE_MS;
-        pulseTimes[i]    = DEFAULT_PULSE_MS;
+        pulseMs[i] = DEFAULT_PULSE_MS;
     }
 }
+
+// ==================== BEGIN ====================
 
 void IOManager::begin() {
-    LOG_INFO("Inicializando IOManager (18 canais)...");
+    // Configura pinos de saída
+    for (uint8_t i = 0; i < NUM_LOCAL_OUTPUTS; i++) {
+        pinMode(OUTPUT_PINS[i], OUTPUT);
+        digitalWrite(OUTPUT_PINS[i],
+            (relayLogic == RELAY_LOGIC_INVERTED) ? HIGH : LOW);
+    }
 
-    prefs.begin(PREFS_NAMESPACE, false);
+    // Configura pinos de entrada (INPUT_ONLY: 34, 35, 36, 39)
+    for (uint8_t i = 0; i < NUM_LOCAL_INPUTS; i++) {
+        pinMode(INPUT_PINS[i], INPUT);
+        lastInputRaw[i] = digitalRead(INPUT_PINS[i]);
+    }
+
     loadConfig();
-    initLocalPins();
+    applyInitialState();
 
-    // Registra callback dos escravos para detectar mudanças nas entradas I2C
-    slaves->setInputChangedCallback([this](uint8_t slaveIndex, uint8_t inputIndex, bool state) {
-        this->onSlaveInputChanged(slaveIndex, inputIndex, state);
-    });
-
-    applyInitialStates();
-
-    LOG_INFO("IOManager inicializado! (2 locais + 8+8 via I2C = 18 canais)");
+    LOG_INFO("IOManager iniciado (2 saidas + 2 entradas locais + 16 via I2C = 18CH)");
 }
 
-void IOManager::handle() {
-    handleLocalInputs();
-    handlePulses();
+void IOManager::applyInitialState() {
+    if (initialState == INITIAL_STATE_ON) {
+        for (uint8_t i = 0; i < NUM_LOCAL_OUTPUTS; i++) setOutput(i, true);
+    } else if (initialState == INITIAL_STATE_LAST) {
+        prefs.begin(PREFS_NAMESPACE, true);
+        for (uint8_t i = 0; i < NUM_LOCAL_OUTPUTS; i++) {
+            char key[16];
+            snprintf(key, sizeof(key), "%s%d", PREFS_RELAY_STATE_PREFIX, i);
+            bool saved = prefs.getBool(key, false);
+            setOutput(i, saved);
+        }
+        prefs.end();
+    }
+    // INITIAL_STATE_OFF — já zerado no construtor
 }
 
 // ==================== SAÍDAS ====================
@@ -53,260 +77,212 @@ void IOManager::handle() {
 void IOManager::setOutput(uint8_t index, bool state) {
     if (index >= NUM_TOTAL_OUTPUTS) return;
 
-    // Cancela pulso se ativo
-    if (pulseActive[index]) pulseActive[index] = false;
+    outputStates[index] = state;
 
-    bool changed = false;
-
-    if (isLocalOutput(index)) {
-        // Output local
-        changed = (localOutputStates[index] != state);
-        localOutputStates[index] = state;
-        setLocalOutput(index, state);
+    if (index < NUM_LOCAL_OUTPUTS) {
+        applyOutputHardware(index, state);
     } else {
-        // Output de escravo
-        uint8_t si  = getSlaveIndex(index);
-        uint8_t chi = getSlaveChannelIndex(index);
-        changed = (slaves->getOutput(si, chi) != state);
-        slaves->setOutput(si, chi, state);
+        // Escravo 1: índices 4–10, Escravo 2: índices 11–17
+        uint8_t slaveIndex  = (index - NUM_LOCAL_OUTPUTS) / NUM_SLAVE_CHANNELS;
+        uint8_t channelIndex = (index - NUM_LOCAL_OUTPUTS) % NUM_SLAVE_CHANNELS;
+        slaves->setOutput(slaveIndex, channelIndex, state);
     }
 
-    if (changed && outputChangedCb) {
-        outputChangedCb(index, state);
-    }
+    if (onOutputChanged) onOutputChanged(index, state);
 }
 
 void IOManager::toggleOutput(uint8_t index) {
-    setOutput(index, !getOutputState(index));
-}
-
-void IOManager::setAllOutputs(bool state) {
-    for (uint8_t i = 0; i < NUM_TOTAL_OUTPUTS; i++) {
-        setOutput(i, state);
-    }
+    if (index < NUM_TOTAL_OUTPUTS)
+        setOutput(index, !outputStates[index]);
 }
 
 bool IOManager::getOutputState(uint8_t index) {
-    if (index >= NUM_TOTAL_OUTPUTS) return false;
-    if (isLocalOutput(index)) return localOutputStates[index];
-    return slaves->getOutput(getSlaveIndex(index), getSlaveChannelIndex(index));
+    return (index < NUM_TOTAL_OUTPUTS) ? outputStates[index] : false;
+}
+
+void IOManager::setAllOutputs(bool state) {
+    for (uint8_t i = 0; i < NUM_TOTAL_OUTPUTS; i++) setOutput(i, state);
+}
+
+void IOManager::applyOutputHardware(uint8_t index, bool state) {
+    bool level = (relayLogic == RELAY_LOGIC_INVERTED) ? !state : state;
+    digitalWrite(OUTPUT_PINS[index], level ? HIGH : LOW);
 }
 
 // ==================== ENTRADAS ====================
 
 bool IOManager::getInputState(uint8_t index) {
-    if (index >= NUM_TOTAL_INPUTS) return false;
-    if (isLocalInput(index)) return localInputStates[index];
-    return slaves->getInput(getSlaveIndex(index), getSlaveChannelIndex(index));
+    return (index < NUM_TOTAL_INPUTS) ? inputStates[index] : false;
 }
 
-// ==================== CONFIGURAÇÃO ====================
-
-void IOManager::setRelayLogic(RelayLogic logic) {
-    relayLogic = logic;
-    // Reaplica nas saídas locais
-    for (uint8_t i = 0; i < NUM_LOCAL_OUTPUTS; i++) {
-        setLocalOutput(i, localOutputStates[i]);
-    }
-}
-RelayLogic IOManager::getRelayLogic()           { return relayLogic; }
-void IOManager::setInitialState(InitialState s) { initialState = s; }
-InitialState IOManager::getInitialState()       { return initialState; }
-
-void IOManager::setInputMode(uint8_t index, InputMode mode) {
-    if (index < NUM_TOTAL_INPUTS) inputModes[index] = mode;
-}
-InputMode IOManager::getInputMode(uint8_t index) {
-    if (index >= NUM_TOTAL_INPUTS) return INPUT_MODE_DISABLED;
-    return inputModes[index];
-}
-void IOManager::setDebounceTime(uint8_t index, uint16_t ms) {
-    if (index < NUM_TOTAL_INPUTS)
-        debounceTimes[index] = constrain(ms, MIN_DEBOUNCE_MS, MAX_DEBOUNCE_MS);
-}
-uint16_t IOManager::getDebounceTime(uint8_t index) {
-    if (index >= NUM_TOTAL_INPUTS) return DEFAULT_DEBOUNCE_MS;
-    return debounceTimes[index];
-}
-void IOManager::setPulseTime(uint8_t index, uint16_t ms) {
-    if (index < NUM_TOTAL_INPUTS)
-        pulseTimes[index] = constrain(ms, MIN_PULSE_MS, MAX_PULSE_MS);
-}
-uint16_t IOManager::getPulseTime(uint8_t index) {
-    if (index >= NUM_TOTAL_INPUTS) return DEFAULT_PULSE_MS;
-    return pulseTimes[index];
+bool IOManager::readLocalInput(uint8_t index) const {
+    return digitalRead(INPUT_PINS[index]);
 }
 
-// ==================== CALLBACKS ====================
+// ==================== HANDLE ====================
 
-void IOManager::setOutputChangedCallback(OutputChangedCallback cb) { outputChangedCb = cb; }
-void IOManager::setInputChangedCallback(InputChangedCallback cb)   { inputChangedCb  = cb; }
+void IOManager::handle() {
+    uint32_t now = millis();
 
-// ==================== PERSISTÊNCIA ====================
-
-void IOManager::saveConfig() {
-    prefs.putUChar(PREFS_RELAY_LOGIC,   (uint8_t)relayLogic);
-    prefs.putUChar(PREFS_INITIAL_STATE, (uint8_t)initialState);
-    for (uint8_t i = 0; i < NUM_TOTAL_INPUTS; i++) {
-        String km = String(PREFS_INPUT_MODE_PREFIX) + String(i);
-        String kd = String(PREFS_DEBOUNCE_PREFIX)   + String(i);
-        String kp = String(PREFS_PULSE_PREFIX)       + String(i);
-        prefs.putUChar(km.c_str(), (uint8_t)inputModes[i]);
-        prefs.putUShort(kd.c_str(), debounceTimes[i]);
-        prefs.putUShort(kp.c_str(), pulseTimes[i]);
-    }
-    LOG_INFO("Configurações salvas na flash");
-}
-
-void IOManager::loadConfig() {
-    relayLogic   = (RelayLogic)prefs.getUChar(PREFS_RELAY_LOGIC, RELAY_LOGIC_NORMAL);
-    initialState = (InitialState)prefs.getUChar(PREFS_INITIAL_STATE, INITIAL_STATE_OFF);
-    for (uint8_t i = 0; i < NUM_TOTAL_INPUTS; i++) {
-        String km = String(PREFS_INPUT_MODE_PREFIX) + String(i);
-        String kd = String(PREFS_DEBOUNCE_PREFIX)   + String(i);
-        String kp = String(PREFS_PULSE_PREFIX)       + String(i);
-        inputModes[i]    = (InputMode)prefs.getUChar(km.c_str(), INPUT_MODE_DISABLED);
-        debounceTimes[i] = prefs.getUShort(kd.c_str(), DEFAULT_DEBOUNCE_MS);
-        pulseTimes[i]    = prefs.getUShort(kp.c_str(), DEFAULT_PULSE_MS);
-    }
-    LOG_INFO("Configurações carregadas da flash");
-}
-
-void IOManager::saveOutputStates() {
-    for (uint8_t i = 0; i < NUM_TOTAL_OUTPUTS; i++) {
-        String key = String(PREFS_RELAY_STATE_PREFIX) + String(i);
-        prefs.putBool(key.c_str(), getOutputState(i));
-    }
-}
-
-void IOManager::loadOutputStates() {
-    for (uint8_t i = 0; i < NUM_TOTAL_OUTPUTS; i++) {
-        String key = String(PREFS_RELAY_STATE_PREFIX) + String(i);
-        bool state = prefs.getBool(key.c_str(), false);
-        if (isLocalOutput(i)) {
-            localOutputStates[i] = state;
-        } else {
-            slaves->setOutput(getSlaveIndex(i), getSlaveChannelIndex(i), state);
-        }
-    }
-}
-
-// ==================== INFORMAÇÕES DE MAPEAMENTO ====================
-
-bool IOManager::isLocalOutput(uint8_t index) { return index < NUM_LOCAL_OUTPUTS; }
-bool IOManager::isLocalInput(uint8_t index)  { return index < NUM_LOCAL_INPUTS; }
-
-uint8_t IOManager::getSlaveIndex(uint8_t index) {
-    // outputs 2-9 → slave 0, outputs 10-17 → slave 1
-    // inputs  2-9 → slave 0, inputs  10-17 → slave 1
-    uint8_t base = isLocalOutput(index) ? NUM_LOCAL_OUTPUTS : NUM_LOCAL_INPUTS;
-    return (index - base) / NUM_SLAVE_CHANNELS;
-}
-
-uint8_t IOManager::getSlaveChannelIndex(uint8_t index) {
-    uint8_t base = isLocalOutput(index) ? NUM_LOCAL_OUTPUTS : NUM_LOCAL_INPUTS;
-    return (index - base) % NUM_SLAVE_CHANNELS;
-}
-
-// ==================== MÉTODOS PRIVADOS ====================
-
-void IOManager::initLocalPins() {
-    for (uint8_t i = 0; i < NUM_LOCAL_OUTPUTS; i++) {
-        pinMode(localOutputPins[i], OUTPUT);
-        digitalWrite(localOutputPins[i], LOW);
-    }
+    // Entradas locais com debounce
     for (uint8_t i = 0; i < NUM_LOCAL_INPUTS; i++) {
-        pinMode(localInputPins[i], INPUT);
-        localInputStates[i]     = digitalRead(localInputPins[i]);
-        lastLocalInputStates[i] = localInputStates[i];
-    }
-}
-
-void IOManager::applyInitialStates() {
-    switch (initialState) {
-        case INITIAL_STATE_OFF:
-            LOG_INFO("Estado inicial: TODOS OFF");
-            for (uint8_t i = 0; i < NUM_TOTAL_OUTPUTS; i++) setOutput(i, false);
-            break;
-        case INITIAL_STATE_ON:
-            LOG_INFO("Estado inicial: TODOS ON");
-            for (uint8_t i = 0; i < NUM_TOTAL_OUTPUTS; i++) setOutput(i, true);
-            break;
-        case INITIAL_STATE_LAST:
-            LOG_INFO("Estado inicial: RECUPERANDO ÚLTIMOS");
-            loadOutputStates();
-            for (uint8_t i = 0; i < NUM_LOCAL_OUTPUTS; i++) {
-                setLocalOutput(i, localOutputStates[i]);
-            }
-            break;
-    }
-}
-
-void IOManager::setLocalOutput(uint8_t localIndex, bool state) {
-    if (localIndex >= NUM_LOCAL_OUTPUTS) return;
-    bool physical = (relayLogic == RELAY_LOGIC_INVERTED) ? !state : state;
-    digitalWrite(localOutputPins[localIndex], physical ? HIGH : LOW);
-}
-
-void IOManager::handleLocalInputs() {
-    unsigned long now = millis();
-    for (uint8_t i = 0; i < NUM_LOCAL_INPUTS; i++) {
-        if (inputModes[i] == INPUT_MODE_DISABLED) continue;
-        bool reading = digitalRead(localInputPins[i]);
-        if (reading != lastLocalInputStates[i]) {
-            lastLocalDebounceTime[i] = now;
+        bool raw = readLocalInput(i);
+        if (raw != lastInputRaw[i]) {
+            lastInputRaw[i] = raw;
+            debounceTimer[i] = now;
         }
-        if ((now - lastLocalDebounceTime[i]) > debounceTimes[i]) {
-            if (reading != localInputStates[i]) {
-                localInputStates[i] = reading;
-                processInputChange(i, reading);
+        if ((now - debounceTimer[i]) >= debounceMs[i]) {
+            if (raw != inputStates[i]) {
+                processInput(i, raw);
             }
         }
-        lastLocalInputStates[i] = reading;
     }
-}
 
-void IOManager::handlePulses() {
-    unsigned long now = millis();
-    for (uint8_t i = 0; i < NUM_TOTAL_OUTPUTS; i++) {
-        if (pulseActive[i] && (now - pulseStartTime[i] >= pulseTimes[i])) {
-            pulseActive[i] = false;
+    // Entradas dos escravos
+    for (uint8_t s = 0; s < NUM_SLAVES; s++) {
+        if (!slaves->isSlaveOnline(s)) continue;
+        for (uint8_t c = 0; c < NUM_SLAVE_CHANNELS; c++) {
+            uint8_t idx = NUM_LOCAL_INPUTS + s * NUM_SLAVE_CHANNELS + c;
+            bool raw = slaves->getInput(s, c);
+            if (raw != inputStates[idx]) {
+                inputStates[idx] = raw;
+                if (onInputChanged) onInputChanged(idx, raw);
+            }
+        }
+    }
+
+    // Pulsos ativos nas saídas locais
+    for (uint8_t i = 0; i < NUM_LOCAL_OUTPUTS; i++) {
+        if (pulseTimer[i] > 0 && (now - pulseTimer[i]) >= pulseMs[i]) {
+            pulseTimer[i] = 0;
             setOutput(i, false);
         }
     }
 }
 
-void IOManager::processInputChange(uint8_t index, bool newState) {
-    if (inputChangedCb) inputChangedCb(index, newState);
+void IOManager::processInput(uint8_t index, bool rawState) {
+    bool prevState = inputStates[index];
+    inputStates[index] = rawState;
 
-    // Executa lógica de vinculação entrada→saída (mesmo índice)
-    if (index < NUM_TOTAL_OUTPUTS) {
-        switch (inputModes[index]) {
-            case INPUT_MODE_TRANSITION:
-                if (newState) toggleOutput(index);
-                break;
-            case INPUT_MODE_PULSE:
-                if (newState) {
-                    setOutput(index, true);
-                    pulseActive[index]    = true;
-                    pulseStartTime[index] = millis();
-                }
-                break;
-            case INPUT_MODE_FOLLOW:
-                setOutput(index, newState);
-                break;
-            case INPUT_MODE_INVERTED:
-                setOutput(index, !newState);
-                break;
-            default:
-                break;
-        }
+    if (onInputChanged) onInputChanged(index, rawState);
+
+    if (inputMode[index] == INPUT_MODE_DISABLED) return;
+
+    // Só atua na borda de subida (exceto FOLLOW/INVERTED)
+    bool risingEdge = rawState && !prevState;
+
+    switch (inputMode[index]) {
+        case INPUT_MODE_TRANSITION:
+            if (risingEdge && index < NUM_LOCAL_OUTPUTS)
+                toggleOutput(index);
+            break;
+
+        case INPUT_MODE_PULSE:
+            if (risingEdge && index < NUM_LOCAL_OUTPUTS) {
+                setOutput(index, true);
+                pulseTimer[index] = millis();
+            }
+            break;
+
+        case INPUT_MODE_FOLLOW:
+            if (index < NUM_LOCAL_OUTPUTS)
+                setOutput(index, rawState);
+            break;
+
+        case INPUT_MODE_INVERTED:
+            if (index < NUM_LOCAL_OUTPUTS)
+                setOutput(index, !rawState);
+            break;
+
+        default:
+            break;
     }
 }
 
-// Chamado pelo I2CSlaveManager quando detecta mudança de entrada em um escravo
-void IOManager::onSlaveInputChanged(uint8_t slaveIndex, uint8_t inputIndex, bool state) {
-    // Converte para índice unificado
-    uint8_t unifiedIndex = NUM_LOCAL_INPUTS + slaveIndex * NUM_SLAVE_CHANNELS + inputIndex;
-    processInputChange(unifiedIndex, state);
+// ==================== CONFIG ====================
+
+void IOManager::setRelayLogic(RelayLogic logic) {
+    relayLogic = logic;
+    // Reaplicar nos pinos locais
+    for (uint8_t i = 0; i < NUM_LOCAL_OUTPUTS; i++)
+        applyOutputHardware(i, outputStates[i]);
+}
+
+void IOManager::setInitialState(InitialState is) {
+    initialState = is;
+}
+
+void IOManager::setInputMode(uint8_t index, InputMode mode) {
+    if (index < NUM_TOTAL_INPUTS) inputMode[index] = mode;
+}
+
+InputMode IOManager::getInputMode(uint8_t index) {
+    return (index < NUM_TOTAL_INPUTS) ? inputMode[index] : INPUT_MODE_DISABLED;
+}
+
+void IOManager::setDebounceTime(uint8_t index, uint16_t ms) {
+    if (index < NUM_TOTAL_INPUTS)
+        debounceMs[index] = constrain(ms, MIN_DEBOUNCE_MS, MAX_DEBOUNCE_MS);
+}
+
+uint16_t IOManager::getDebounceTime(uint8_t index) {
+    return (index < NUM_TOTAL_INPUTS) ? debounceMs[index] : DEFAULT_DEBOUNCE_MS;
+}
+
+void IOManager::setPulseTime(uint8_t index, uint16_t ms) {
+    if (index < NUM_LOCAL_OUTPUTS)
+        pulseMs[index] = constrain(ms, MIN_PULSE_MS, MAX_PULSE_MS);
+}
+
+uint16_t IOManager::getPulseTime(uint8_t index) {
+    return (index < NUM_LOCAL_OUTPUTS) ? pulseMs[index] : DEFAULT_PULSE_MS;
+}
+
+// ==================== PERSISTÊNCIA ====================
+
+void IOManager::saveConfig() {
+    prefs.begin(PREFS_NAMESPACE, false);
+    prefs.putUInt(PREFS_RELAY_LOGIC,   (uint32_t)relayLogic);
+    prefs.putUInt(PREFS_INITIAL_STATE, (uint32_t)initialState);
+    prefs.putUInt(PREFS_TELE_INTERVAL, 0); // reservado
+
+    for (uint8_t i = 0; i < NUM_TOTAL_INPUTS; i++) {
+        char k1[20], k2[20];
+        snprintf(k1, sizeof(k1), "%s%d", PREFS_INPUT_MODE_PREFIX, i);
+        snprintf(k2, sizeof(k2), "%s%d", PREFS_DEBOUNCE_PREFIX, i);
+        prefs.putUChar(k1, (uint8_t)inputMode[i]);
+        prefs.putUShort(k2, debounceMs[i]);
+    }
+    for (uint8_t i = 0; i < NUM_LOCAL_OUTPUTS; i++) {
+        char k[20];
+        snprintf(k, sizeof(k), "%s%d", PREFS_PULSE_PREFIX, i);
+        prefs.putUShort(k, pulseMs[i]);
+
+        // Salva estado atual para INITIAL_STATE_LAST
+        char ks[20];
+        snprintf(ks, sizeof(ks), "%s%d", PREFS_RELAY_STATE_PREFIX, i);
+        prefs.putBool(ks, outputStates[i]);
+    }
+    prefs.end();
+    LOG_INFO("IOManager: config salva");
+}
+
+void IOManager::loadConfig() {
+    prefs.begin(PREFS_NAMESPACE, true);
+    relayLogic   = (RelayLogic)  prefs.getUInt(PREFS_RELAY_LOGIC,   0);
+    initialState = (InitialState)prefs.getUInt(PREFS_INITIAL_STATE, 0);
+
+    for (uint8_t i = 0; i < NUM_TOTAL_INPUTS; i++) {
+        char k1[20], k2[20];
+        snprintf(k1, sizeof(k1), "%s%d", PREFS_INPUT_MODE_PREFIX, i);
+        snprintf(k2, sizeof(k2), "%s%d", PREFS_DEBOUNCE_PREFIX, i);
+        inputMode [i] = (InputMode)prefs.getUChar(k1, INPUT_MODE_DISABLED);
+        debounceMs[i] = prefs.getUShort(k2, DEFAULT_DEBOUNCE_MS);
+    }
+    for (uint8_t i = 0; i < NUM_LOCAL_OUTPUTS; i++) {
+        char k[20];
+        snprintf(k, sizeof(k), "%s%d", PREFS_PULSE_PREFIX, i);
+        pulseMs[i] = prefs.getUShort(k, DEFAULT_PULSE_MS);
+    }
+    prefs.end();
 }
