@@ -79,6 +79,10 @@ void setup() {
     Serial.println();
 
     // Watchdog (API core 3.x — usa struct)
+    // FIX: desinicializa antes para evitar erro "TWDT already initialized"
+    //      que ocorre quando o watchdog dispara e o chip reinicia via SW_CPU_RESET
+    esp_task_wdt_deinit();
+
     esp_task_wdt_config_t wdtConfig = {
         .timeout_ms     = WATCHDOG_TIMEOUT_SEC * 1000,
         .idle_core_mask = 0,
@@ -92,9 +96,11 @@ void setup() {
     //    Garante acesso à interface mesmo se ETH travar
     core.begin();
 
-    // 2) Inicializa Ethernet (WT32-ETH01 — LAN8720)
-    //    Core 3.x: primeiro argumento é o tipo, depois addr
+    // FIX: registra evento ETH antes de ETH.begin() para não perder
+    //      o evento ARDUINO_EVENT_ETH_START que ocorre logo no begin()
     WiFi.onEvent(onEthEvent);
+
+    // 2) Inicializa Ethernet (WT32-ETH01 — LAN8720)
     ethCfg.begin(); // aplica IP fixo se configurado
     ETH.begin(ETH_PHY_TYPE,
               ETH_PHY_ADDR,
@@ -103,9 +109,16 @@ void setup() {
               ETH_PHY_POWER,
               ETH_CLK_MODE);
 
+    // FIX: alimenta o watchdog dentro do while de espera do ETH
+    //      sem isso o WDT dispara após ~30s (WATCHDOG_TIMEOUT_SEC),
+    //      causa SW_CPU_RESET, incrementa boot counter e após 6x
+    //      ativa o factory reset — gerando o loop infinito observado
     LOG_INFO("Aguardando IP Ethernet...");
     unsigned long t = millis();
-    while (!ethConnected && millis() - t < 10000) delay(100);
+    while (!ethConnected && millis() - t < 10000) {
+        esp_task_wdt_reset();
+        delay(100);
+    }
 
     if (ethConnected) {
         LOG_INFOF("Ethernet OK! IP: %s", ETH.localIP().toString().c_str());
