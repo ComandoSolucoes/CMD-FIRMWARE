@@ -26,19 +26,21 @@ public:
     // Entradas
     bool getInputState(uint8_t index);
 
-    // Configuração
+    // Configuração geral
     void         setRelayLogic(RelayLogic logic);
-    RelayLogic   getRelayLogic() const { return relayLogic; }
-
+    RelayLogic   getRelayLogic()   const { return relayLogic; }
     void         setInitialState(InitialState is);
     InitialState getInitialState() const { return initialState; }
 
+    // Config por canal de entrada (índice global 0-17)
     void      setInputMode(uint8_t index, InputMode mode);
     InputMode getInputMode(uint8_t index);
 
     void     setDebounceTime(uint8_t index, uint16_t ms);
     uint16_t getDebounceTime(uint8_t index);
 
+    // Tempo de pulso — indexado por canal de ENTRADA (0-17)
+    // Locais (0-1): timer do mestre | Escravos (2-17): enviado via cfg I2C
     void     setPulseTime(uint8_t index, uint16_t ms);
     uint16_t getPulseTime(uint8_t index);
 
@@ -50,21 +52,25 @@ public:
     void saveConfig();
     void loadConfig();
 
+    // Envia config atual de todos os escravos via I2C (boot + save config)
+    void pushSlavesConfig();
+
 private:
     I2CSlaveManager* slaves;
 
-    bool outputStates[NUM_TOTAL_OUTPUTS];
-    bool inputStates [NUM_TOTAL_INPUTS];
-    bool lastInputRaw[NUM_TOTAL_INPUTS];
+    bool     outputStates[NUM_TOTAL_OUTPUTS];
+    bool     inputStates [NUM_TOTAL_INPUTS];
+    bool     lastInputRaw[NUM_LOCAL_INPUTS];  // debounce só nas entradas locais
 
-    uint32_t debounceTimer[NUM_TOTAL_INPUTS];
-    uint32_t pulseTimer   [NUM_LOCAL_OUTPUTS];
+    uint32_t debounceTimer[NUM_LOCAL_INPUTS];
+    uint32_t pulseTimer   [NUM_LOCAL_INPUTS]; // pulso das entradas locais
 
     RelayLogic   relayLogic;
     InitialState initialState;
-    InputMode    inputMode   [NUM_TOTAL_INPUTS];
-    uint16_t     debounceMs  [NUM_TOTAL_INPUTS];
-    uint16_t     pulseMs     [NUM_LOCAL_OUTPUTS];
+
+    InputMode inputMode [NUM_TOTAL_INPUTS];
+    uint16_t  debounceMs[NUM_TOTAL_INPUTS];
+    uint16_t  pulseMs   [NUM_TOTAL_INPUTS]; // armazenado para todos; escravos recebem via cfg
 
     OutputChangedCallback onOutputChanged;
     InputChangedCallback  onInputChanged;

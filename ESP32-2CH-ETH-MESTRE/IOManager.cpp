@@ -1,7 +1,5 @@
 #include "IOManager.h"
 
-// ==================== PINOS LOCAIS (do Config.h) ====================
-
 const uint8_t IOManager::OUTPUT_PINS[NUM_LOCAL_OUTPUTS] = {
     LOCAL_OUTPUT_1_PIN,   // GPIO14 — rele1
     LOCAL_OUTPUT_2_PIN    // GPIO12 — rele2
@@ -9,7 +7,7 @@ const uint8_t IOManager::OUTPUT_PINS[NUM_LOCAL_OUTPUTS] = {
 
 const uint8_t IOManager::INPUT_PINS[NUM_LOCAL_INPUTS] = {
     LOCAL_INPUT_1_PIN,    // GPIO39 — InC01
-    LOCAL_INPUT_2_PIN     // GPIO36 — InC02
+    LOCAL_INPUT_2_PIN     // GPIO37 — InC02
 };
 
 // ==================== CONSTRUTOR ====================
@@ -25,33 +23,38 @@ IOManager::IOManager(I2CSlaveManager* slaveMgr)
     memset(debounceTimer, 0, sizeof(debounceTimer));
     memset(pulseTimer,    0, sizeof(pulseTimer));
 
-    for (uint8_t i = 0; i < NUM_TOTAL_INPUTS;  i++) {
-        inputMode  [i] = INPUT_MODE_DISABLED;
-        debounceMs [i] = DEFAULT_DEBOUNCE_MS;
-    }
-    for (uint8_t i = 0; i < NUM_LOCAL_OUTPUTS; i++) {
-        pulseMs[i] = DEFAULT_PULSE_MS;
+    for (uint8_t i = 0; i < NUM_TOTAL_INPUTS; i++) {
+        inputMode [i] = INPUT_MODE_TRANSITION;  // padrão: ativo, faz toggle
+        debounceMs[i] = DEFAULT_DEBOUNCE_MS;
+        pulseMs   [i] = DEFAULT_PULSE_MS;
     }
 }
 
 // ==================== BEGIN ====================
 
 void IOManager::begin() {
-    // Configura pinos de saída
+    // Pinos de saída local
     for (uint8_t i = 0; i < NUM_LOCAL_OUTPUTS; i++) {
         pinMode(OUTPUT_PINS[i], OUTPUT);
         digitalWrite(OUTPUT_PINS[i],
             (relayLogic == RELAY_LOGIC_INVERTED) ? HIGH : LOW);
     }
 
-    // Configura pinos de entrada (INPUT_ONLY: 34, 35, 36, 39)
+    // Pinos de entrada local (INPUT_ONLY GPIOs 37 e 39)
     for (uint8_t i = 0; i < NUM_LOCAL_INPUTS; i++) {
         pinMode(INPUT_PINS[i], INPUT);
         lastInputRaw[i] = digitalRead(INPUT_PINS[i]);
     }
 
+    // Carrega config + estados da NVS
     loadConfig();
+
+    // Aplica estado inicial nas saídas locais
     applyInitialState();
+
+    // Empurra config completa + estados para os escravos no boot
+    // Isso garante que os escravos partam com a última configuração salva
+    pushSlavesConfig();
 
     LOG_INFO("IOManager iniciado (2 saidas + 2 entradas locais + 16 via I2C = 18CH)");
 }
@@ -59,17 +62,22 @@ void IOManager::begin() {
 void IOManager::applyInitialState() {
     if (initialState == INITIAL_STATE_ON) {
         for (uint8_t i = 0; i < NUM_LOCAL_OUTPUTS; i++) setOutput(i, true);
+
     } else if (initialState == INITIAL_STATE_LAST) {
-        prefs.begin(PREFS_NAMESPACE, true);
+        // Aplica estados locais restaurados pelo loadConfig() no hardware
         for (uint8_t i = 0; i < NUM_LOCAL_OUTPUTS; i++) {
-            char key[16];
-            snprintf(key, sizeof(key), "%s%d", PREFS_RELAY_STATE_PREFIX, i);
-            bool saved = prefs.getBool(key, false);
-            setOutput(i, saved);
+            applyOutputHardware(i, outputStates[i]);
         }
-        prefs.end();
+        // Estados dos escravos já foram pré-carregados em loadConfig() via slaves->setOutput()
+        // O pushSlavesConfig() no boot enviará tudo via I2C
+
+    } else {
+        // INITIAL_STATE_OFF — zera saídas locais
+        for (uint8_t i = 0; i < NUM_LOCAL_OUTPUTS; i++) {
+            outputStates[i] = false;
+            applyOutputHardware(i, false);
+        }
     }
-    // INITIAL_STATE_OFF — já zerado no construtor
 }
 
 // ==================== SAÍDAS ====================
@@ -82,10 +90,9 @@ void IOManager::setOutput(uint8_t index, bool state) {
     if (index < NUM_LOCAL_OUTPUTS) {
         applyOutputHardware(index, state);
     } else {
-        // Escravo 1: índices 4–10, Escravo 2: índices 11–17
-        uint8_t slaveIndex  = (index - NUM_LOCAL_OUTPUTS) / NUM_SLAVE_CHANNELS;
-        uint8_t channelIndex = (index - NUM_LOCAL_OUTPUTS) % NUM_SLAVE_CHANNELS;
-        slaves->setOutput(slaveIndex, channelIndex, state);
+        uint8_t si = (index - NUM_LOCAL_OUTPUTS) / NUM_SLAVE_CHANNELS;
+        uint8_t ci = (index - NUM_LOCAL_OUTPUTS) % NUM_SLAVE_CHANNELS;
+        slaves->setOutput(si, ci, state);
     }
 
     if (onOutputChanged) onOutputChanged(index, state);
@@ -128,7 +135,7 @@ void IOManager::handle() {
     for (uint8_t i = 0; i < NUM_LOCAL_INPUTS; i++) {
         bool raw = readLocalInput(i);
         if (raw != lastInputRaw[i]) {
-            lastInputRaw[i] = raw;
+            lastInputRaw[i]  = raw;
             debounceTimer[i] = now;
         }
         if ((now - debounceTimer[i]) >= debounceMs[i]) {
@@ -138,7 +145,7 @@ void IOManager::handle() {
         }
     }
 
-    // Entradas dos escravos
+    // Entradas dos escravos (mestre só detecta mudança para MQTT; escravo já atuou localmente)
     for (uint8_t s = 0; s < NUM_SLAVES; s++) {
         if (!slaves->isSlaveOnline(s)) continue;
         for (uint8_t c = 0; c < NUM_SLAVE_CHANNELS; c++) {
@@ -151,16 +158,18 @@ void IOManager::handle() {
         }
     }
 
-    // Pulsos ativos nas saídas locais
-    for (uint8_t i = 0; i < NUM_LOCAL_OUTPUTS; i++) {
+    // Pulsos ativos nas entradas locais
+    for (uint8_t i = 0; i < NUM_LOCAL_INPUTS; i++) {
         if (pulseTimer[i] > 0 && (now - pulseTimer[i]) >= pulseMs[i]) {
             pulseTimer[i] = 0;
-            setOutput(i, false);
+            if (i < NUM_LOCAL_OUTPUTS) setOutput(i, false);
         }
     }
 }
 
 void IOManager::processInput(uint8_t index, bool rawState) {
+    if (index >= NUM_LOCAL_INPUTS) return;
+
     bool prevState = inputStates[index];
     inputStates[index] = rawState;
 
@@ -168,7 +177,6 @@ void IOManager::processInput(uint8_t index, bool rawState) {
 
     if (inputMode[index] == INPUT_MODE_DISABLED) return;
 
-    // Só atua na borda de subida (exceto FOLLOW/INVERTED)
     bool risingEdge = rawState && !prevState;
 
     switch (inputMode[index]) {
@@ -203,7 +211,6 @@ void IOManager::processInput(uint8_t index, bool rawState) {
 
 void IOManager::setRelayLogic(RelayLogic logic) {
     relayLogic = logic;
-    // Reaplicar nos pinos locais
     for (uint8_t i = 0; i < NUM_LOCAL_OUTPUTS; i++)
         applyOutputHardware(i, outputStates[i]);
 }
@@ -230,59 +237,104 @@ uint16_t IOManager::getDebounceTime(uint8_t index) {
 }
 
 void IOManager::setPulseTime(uint8_t index, uint16_t ms) {
-    if (index < NUM_LOCAL_OUTPUTS)
+    if (index < NUM_TOTAL_INPUTS)
         pulseMs[index] = constrain(ms, MIN_PULSE_MS, MAX_PULSE_MS);
 }
 
 uint16_t IOManager::getPulseTime(uint8_t index) {
-    return (index < NUM_LOCAL_OUTPUTS) ? pulseMs[index] : DEFAULT_PULSE_MS;
+    return (index < NUM_TOTAL_INPUTS) ? pulseMs[index] : DEFAULT_PULSE_MS;
+}
+
+// ==================== PUSH CONFIG AOS ESCRAVOS ====================
+
+void IOManager::pushSlavesConfig() {
+    for (uint8_t s = 0; s < NUM_SLAVES; s++) {
+        SlaveChannelConfig cfg[NUM_SLAVE_CHANNELS];
+
+        for (uint8_t c = 0; c < NUM_SLAVE_CHANNELS; c++) {
+            uint8_t inputIdx = NUM_LOCAL_INPUTS + s * NUM_SLAVE_CHANNELS + c;
+            cfg[c].mode    = (uint8_t)inputMode [inputIdx];
+            cfg[c].debMs   = debounceMs[inputIdx];
+            cfg[c].pulseMs = pulseMs   [inputIdx];
+        }
+
+        slaves->pushConfig(s, cfg);
+    }
+
+    LOG_INFO("pushSlavesConfig: config agendada para S1 e S2");
 }
 
 // ==================== PERSISTÊNCIA ====================
 
 void IOManager::saveConfig() {
     prefs.begin(PREFS_NAMESPACE, false);
+
     prefs.putUInt(PREFS_RELAY_LOGIC,   (uint32_t)relayLogic);
     prefs.putUInt(PREFS_INITIAL_STATE, (uint32_t)initialState);
-    prefs.putUInt(PREFS_TELE_INTERVAL, 0); // reservado
 
+    // Modos, debounce e pulse de TODAS as 18 entradas
     for (uint8_t i = 0; i < NUM_TOTAL_INPUTS; i++) {
-        char k1[20], k2[20];
+        char k1[24], k2[24], k3[24];
         snprintf(k1, sizeof(k1), "%s%d", PREFS_INPUT_MODE_PREFIX, i);
-        snprintf(k2, sizeof(k2), "%s%d", PREFS_DEBOUNCE_PREFIX, i);
-        prefs.putUChar(k1, (uint8_t)inputMode[i]);
+        snprintf(k2, sizeof(k2), "%s%d", PREFS_DEBOUNCE_PREFIX,   i);
+        snprintf(k3, sizeof(k3), "%s%d", PREFS_PULSE_PREFIX,      i);
+        prefs.putUChar (k1, (uint8_t)inputMode [i]);
         prefs.putUShort(k2, debounceMs[i]);
+        prefs.putUShort(k3, pulseMs   [i]);
     }
-    for (uint8_t i = 0; i < NUM_LOCAL_OUTPUTS; i++) {
-        char k[20];
-        snprintf(k, sizeof(k), "%s%d", PREFS_PULSE_PREFIX, i);
-        prefs.putUShort(k, pulseMs[i]);
 
-        // Salva estado atual para INITIAL_STATE_LAST
-        char ks[20];
+    // Estado atual de TODAS as 18 saídas (para INITIAL_STATE_LAST)
+    for (uint8_t i = 0; i < NUM_TOTAL_OUTPUTS; i++) {
+        char ks[24];
         snprintf(ks, sizeof(ks), "%s%d", PREFS_RELAY_STATE_PREFIX, i);
         prefs.putBool(ks, outputStates[i]);
     }
+
     prefs.end();
-    LOG_INFO("IOManager: config salva");
+    LOG_INFO("IOManager: config salva (18 canais de entrada + 18 estados de saida)");
 }
 
 void IOManager::loadConfig() {
     prefs.begin(PREFS_NAMESPACE, true);
-    relayLogic   = (RelayLogic)  prefs.getUInt(PREFS_RELAY_LOGIC,   0);
-    initialState = (InitialState)prefs.getUInt(PREFS_INITIAL_STATE, 0);
 
+    relayLogic   = (RelayLogic)  prefs.getUInt(PREFS_RELAY_LOGIC,   RELAY_LOGIC_NORMAL);
+    initialState = (InitialState)prefs.getUInt(PREFS_INITIAL_STATE, INITIAL_STATE_OFF);
+
+    // Modos, debounce e pulse de todas as 18 entradas
     for (uint8_t i = 0; i < NUM_TOTAL_INPUTS; i++) {
-        char k1[20], k2[20];
+        char k1[24], k2[24], k3[24];
         snprintf(k1, sizeof(k1), "%s%d", PREFS_INPUT_MODE_PREFIX, i);
-        snprintf(k2, sizeof(k2), "%s%d", PREFS_DEBOUNCE_PREFIX, i);
-        inputMode [i] = (InputMode)prefs.getUChar(k1, INPUT_MODE_DISABLED);
+        snprintf(k2, sizeof(k2), "%s%d", PREFS_DEBOUNCE_PREFIX,   i);
+        snprintf(k3, sizeof(k3), "%s%d", PREFS_PULSE_PREFIX,      i);
+        // Padrão TRANSITION: garante que funcione sem cfg prévia
+        inputMode [i] = (InputMode)prefs.getUChar (k1, INPUT_MODE_TRANSITION);
         debounceMs[i] = prefs.getUShort(k2, DEFAULT_DEBOUNCE_MS);
+        pulseMs   [i] = prefs.getUShort(k3, DEFAULT_PULSE_MS);
     }
-    for (uint8_t i = 0; i < NUM_LOCAL_OUTPUTS; i++) {
-        char k[20];
-        snprintf(k, sizeof(k), "%s%d", PREFS_PULSE_PREFIX, i);
-        pulseMs[i] = prefs.getUShort(k, DEFAULT_PULSE_MS);
+
+    // Estados de todas as 18 saídas
+    for (uint8_t i = 0; i < NUM_TOTAL_OUTPUTS; i++) {
+        char ks[24];
+        snprintf(ks, sizeof(ks), "%s%d", PREFS_RELAY_STATE_PREFIX, i);
+        outputStates[i] = prefs.getBool(ks, false);
     }
+
     prefs.end();
+
+    // Pré-carrega estados dos escravos no SlaveManager
+    // (serão enviados via I2C pelo pushSlavesConfig() no boot)
+    for (uint8_t i = NUM_LOCAL_OUTPUTS; i < NUM_TOTAL_OUTPUTS; i++) {
+        uint8_t si = (i - NUM_LOCAL_OUTPUTS) / NUM_SLAVE_CHANNELS;
+        uint8_t ci = (i - NUM_LOCAL_OUTPUTS) % NUM_SLAVE_CHANNELS;
+        slaves->setOutput(si, ci, outputStates[i]);
+    }
+
+    LOG_INFO("IOManager: config carregada:");
+    for (uint8_t i = 0; i < NUM_TOTAL_INPUTS; i++) {
+        LOG_INFOF("  IN%02d: mode=%d  deb=%dms  pulse=%dms  | OUT%02d: %s",
+            i + 1,
+            (uint8_t)inputMode[i], debounceMs[i], pulseMs[i],
+            i + 1,
+            (i < NUM_TOTAL_OUTPUTS && outputStates[i]) ? "ON" : "OFF");
+    }
 }

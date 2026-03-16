@@ -10,25 +10,27 @@ class EthConfig {
 public:
     EthConfig();
 
-    void begin();   // Carrega config da flash e aplica ao ETH
+    // Carrega config da flash e aplica ao ETH (sempre haverá um IP — padrão ou customizado)
+    void begin();
 
-    // Salva IP fixo — chame antes de reiniciar para aplicar
+    // Salva IP fixo definido pelo usuário — chame antes de reiniciar para aplicar
     bool saveStaticIP(const String& ip, const String& gateway,
                       const String& subnet, const String& dns = "");
 
-    // Remove IP fixo — volta para DHCP
+    // Remove IP customizado — próximo boot usará o IP padrão (192.168.1.100)
     void clearStaticIP();
 
-    // Getters
+    // true se o usuário salvou um IP customizado (false = usando IP padrão)
     bool    hasStaticIP()   { return useStatic; }
-    String  getIP()         { return staticIP; }
-    String  getGateway()    { return staticGW; }
-    String  getSubnet()     { return staticSN; }
+
+    String  getIP()         { return staticIP;  }
+    String  getGateway()    { return staticGW;  }
+    String  getSubnet()     { return staticSN;  }
     String  getDNS()        { return staticDNS; }
 
 private:
     Preferences prefs;
-    bool   useStatic;
+    bool   useStatic;   // true = IP customizado pelo usuário; false = IP padrão
     String staticIP;
     String staticGW;
     String staticSN;

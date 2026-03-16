@@ -1,5 +1,4 @@
 #include "I2CSlaveManager.h"
-// LOG_WARNF já está definido em Config.h (incluído via I2CSlaveManager.h)
 
 I2CSlaveManager::I2CSlaveManager()
     : lastPollTime(0), inputChangedCb(nullptr) {
@@ -9,10 +8,12 @@ I2CSlaveManager::I2CSlaveManager()
         slaveStatus[s].lastContact = 0;
         slaveStatus[s].errorCount  = 0;
         slaveStatus[s].totalErrors = 0;
+        pendingConfigPush[s]       = false;
 
         for (uint8_t i = 0; i < NUM_SLAVE_CHANNELS; i++) {
             slaveData[s].outputs[i] = false;
             slaveData[s].inputs[i]  = false;
+            slaveConfig[s][i]       = SlaveChannelConfig{};
         }
     }
 }
@@ -20,6 +21,9 @@ I2CSlaveManager::I2CSlaveManager()
 void I2CSlaveManager::begin() {
     LOG_INFO("Inicializando I2C Slave Manager...");
 
+    // IMPORTANTE: setBufferSize ANTES de Wire.begin()
+    // O JSON com cfg completo pode chegar a ~420 bytes
+    Wire.setBufferSize(I2C_BUF_SIZE);
     Wire.setPins(I2C_SDA_PIN, I2C_SCL_PIN);
     Wire.begin();
     Wire.setClock(I2C_FREQ);
@@ -50,6 +54,8 @@ void I2CSlaveManager::handle() {
     }
 }
 
+// ==================== SAÍDAS ====================
+
 void I2CSlaveManager::setOutput(uint8_t slaveIndex, uint8_t outputIndex, bool state) {
     if (slaveIndex >= NUM_SLAVES || outputIndex >= NUM_SLAVE_CHANNELS) return;
     slaveData[slaveIndex].outputs[outputIndex] = state;
@@ -60,10 +66,14 @@ bool I2CSlaveManager::getOutput(uint8_t slaveIndex, uint8_t outputIndex) {
     return slaveData[slaveIndex].outputs[outputIndex];
 }
 
+// ==================== ENTRADAS ====================
+
 bool I2CSlaveManager::getInput(uint8_t slaveIndex, uint8_t inputIndex) {
     if (slaveIndex >= NUM_SLAVES || inputIndex >= NUM_SLAVE_CHANNELS) return false;
     return slaveData[slaveIndex].inputs[inputIndex];
 }
+
+// ==================== STATUS ====================
 
 bool I2CSlaveManager::isSlaveOnline(uint8_t slaveIndex) {
     if (slaveIndex >= NUM_SLAVES) return false;
@@ -78,6 +88,22 @@ SlaveStatus I2CSlaveManager::getSlaveStatus(uint8_t slaveIndex) {
 void I2CSlaveManager::setInputChangedCallback(SlaveInputChangedCallback cb) {
     inputChangedCb = cb;
 }
+
+// ==================== CONFIG PUSH ====================
+
+void I2CSlaveManager::pushConfig(uint8_t slaveIndex,
+                                  const SlaveChannelConfig cfg[NUM_SLAVE_CHANNELS]) {
+    if (slaveIndex >= NUM_SLAVES) return;
+
+    for (uint8_t i = 0; i < NUM_SLAVE_CHANNELS; i++) {
+        slaveConfig[slaveIndex][i] = cfg[i];
+    }
+    pendingConfigPush[slaveIndex] = true;
+
+    LOG_INFOF("Config agendada para escravo %d (sera enviada no proximo ciclo I2C)", slaveIndex + 1);
+}
+
+// ==================== COMUNICAÇÃO ====================
 
 bool I2CSlaveManager::communicateWithSlave(uint8_t slaveIndex) {
     bool previousInputs[NUM_SLAVE_CHANNELS];
@@ -115,18 +141,32 @@ bool I2CSlaveManager::communicateWithSlave(uint8_t slaveIndex) {
 }
 
 bool I2CSlaveManager::sendOutputsJson(uint8_t slaveIndex) {
-    StaticJsonDocument<300> doc;
+    // Documento maior quando há cfg pendente (com cfg ~420 bytes, sem cfg ~80 bytes)
+    StaticJsonDocument<1024> doc;
 
     for (uint8_t i = 0; i < NUM_SLAVE_CHANNELS; i++) {
-        String key = "do" + String(i + 1);
-        doc[key] = slaveData[slaveIndex].outputs[i] ? 1 : 0;
+        doc["do" + String(i + 1)] = slaveData[slaveIndex].outputs[i] ? 1 : 0;
+    }
+
+    // Embute campo "cfg" apenas quando há push pendente
+    if (pendingConfigPush[slaveIndex]) {
+        JsonObject cfg = doc.createNestedObject("cfg");
+        for (uint8_t i = 0; i < NUM_SLAVE_CHANNELS; i++) {
+            JsonObject ch = cfg.createNestedObject("in" + String(i + 1));
+            ch["mode"]  = slaveConfig[slaveIndex][i].mode;
+            ch["deb"]   = slaveConfig[slaveIndex][i].debMs;
+            ch["pulse"] = slaveConfig[slaveIndex][i].pulseMs;
+        }
+        pendingConfigPush[slaveIndex] = false;  // limpa flag após incluir no JSON
+
+        LOG_INFOF("Escravo %d: enviando estados + cfg completa", slaveIndex + 1);
     }
 
     String output;
     serializeJson(doc, output);
 
     Wire.beginTransmission(slaveAddresses[slaveIndex]);
-    Wire.println(output);
+    Wire.print(output);  // sem \r\n — o escravo identifica pelo '{'
     uint8_t err = Wire.endTransmission(true);
 
     return (err == 0);
@@ -134,7 +174,6 @@ bool I2CSlaveManager::sendOutputsJson(uint8_t slaveIndex) {
 
 bool I2CSlaveManager::receiveInputsJson(uint8_t slaveIndex) {
     uint8_t bytesReceived = Wire.requestFrom(slaveAddresses[slaveIndex], (uint8_t)128);
-
     if (!bytesReceived) return false;
 
     String data = "";
@@ -162,7 +201,8 @@ bool I2CSlaveManager::receiveInputsJson(uint8_t slaveIndex) {
     return true;
 }
 
-void I2CSlaveManager::detectInputChanges(uint8_t slaveIndex, bool previousInputs[NUM_SLAVE_CHANNELS]) {
+void I2CSlaveManager::detectInputChanges(uint8_t slaveIndex,
+                                          bool previousInputs[NUM_SLAVE_CHANNELS]) {
     if (!inputChangedCb) return;
 
     for (uint8_t i = 0; i < NUM_SLAVE_CHANNELS; i++) {

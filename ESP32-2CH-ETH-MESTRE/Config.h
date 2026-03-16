@@ -8,7 +8,6 @@
 #define FIRMWARE_VERSION "1.0.0"
 
 // ==================== ETHERNET (WT32-ETH01 / LAN8720) ====================
-// Pinos fixos do WT32-ETH01 — NÃO alterar
 #define ETH_PHY_ADDR    1
 #define ETH_PHY_TYPE    ETH_PHY_LAN8720
 #define ETH_PHY_POWER   16
@@ -17,33 +16,28 @@
 #define ETH_CLK_MODE    ETH_CLOCK_GPIO0_IN
 
 // ==================== I2C (BARRAMENTO) ====================
-#define I2C_SDA_PIN     4      // Pino SDA — confirmado no código do fornecedor
-#define I2C_SCL_PIN     2      // Pino SCL — confirmado no código do fornecedor
-#define I2C_FREQ        100000 // 100 kHz
+#define I2C_SDA_PIN     4
+#define I2C_SCL_PIN     2
+#define I2C_FREQ        100000
+#define I2C_BUF_SIZE    512     // Buffer para JSON com cfg completo (~420 bytes)
 
-// Endereços I2C dos escravos 8CH — confirmado no código do fornecedor
 #define I2C_SLAVE1_ADDR 0x55
 #define I2C_SLAVE2_ADDR 0x56
 
-// Timeout e intervalo de polling I2C (ms)
 #define I2C_TIMEOUT_MS  50
 #define I2C_POLL_MS     20
 
 // ==================== PINOS LOCAIS (MASTER) ====================
-// Apenas 2 saídas locais — confirmado no código do fornecedor (rele1=14, rele2=12)
-// OutC03/OutC04 não são usados como relés livres
 #define LOCAL_OUTPUT_1_PIN  14  // GPIO14 — rele1
 #define LOCAL_OUTPUT_2_PIN  12  // GPIO12 — rele2
 
-// Entradas locais via optoacopladores (INPUT_ONLY GPIOs)
-#define LOCAL_INPUT_1_PIN   39  // GPIO39 — InC01
-#define LOCAL_INPUT_2_PIN   36  // GPIO36 — InC02
+#define LOCAL_INPUT_1_PIN   39  // GPIO39 — InC01 (INPUT_ONLY)
+#define LOCAL_INPUT_2_PIN   37  // GPIO37 — InC02 (INPUT_ONLY)  ← corrigido de 36
 
 // ==================== CANAIS TOTAIS ====================
-// 2 locais + 2 escravos × 8 canais = 18 CH
 #define NUM_LOCAL_OUTPUTS   2
 #define NUM_LOCAL_INPUTS    2
-#define NUM_SLAVE_CHANNELS  8   // 8 canais por escravo (8CH)
+#define NUM_SLAVE_CHANNELS  8
 #define NUM_SLAVES          2
 #define NUM_TOTAL_OUTPUTS   (NUM_LOCAL_OUTPUTS + NUM_SLAVES * NUM_SLAVE_CHANNELS)  // 18
 #define NUM_TOTAL_INPUTS    (NUM_LOCAL_INPUTS  + NUM_SLAVES * NUM_SLAVE_CHANNELS)  // 18
@@ -53,7 +47,7 @@
 //           2-9   → escravo 1 — 0x55 (do1–do8)
 //           10-17 → escravo 2 — 0x56 (do1–do8)
 //
-// Entradas: 0-1   → locais  (InC01, InC02)
+// Entradas: 0-1   → locais  (InC01 GPIO39, InC02 GPIO37)
 //           2-9   → escravo 1 — 0x55 (di1–di8)
 //           10-17 → escravo 2 — 0x56 (di1–di8)
 
@@ -75,26 +69,26 @@ enum InputMode {
 
 // ==================== CONFIGURAÇÕES DE SAÍDA ====================
 enum RelayLogic {
-    RELAY_LOGIC_NORMAL   = 0,   // HIGH = ON
-    RELAY_LOGIC_INVERTED = 1    // HIGH = OFF
+    RELAY_LOGIC_NORMAL   = 0,
+    RELAY_LOGIC_INVERTED = 1
 };
 
 enum InitialState {
     INITIAL_STATE_OFF  = 0,
     INITIAL_STATE_ON   = 1,
-    INITIAL_STATE_LAST = 2      // Recupera da flash
+    INITIAL_STATE_LAST = 2
 };
 
-// ==================== MQTT — FORMATO TASMOTA ====================
-#define DEFAULT_TELEMETRY_INTERVAL  30000   // 30 s
-#define MIN_TELEMETRY_INTERVAL      5000    // 5 s
-#define MAX_TELEMETRY_INTERVAL      300000  // 5 min
+// ==================== MQTT ====================
+#define DEFAULT_TELEMETRY_INTERVAL  30000
+#define MIN_TELEMETRY_INTERVAL      5000
+#define MAX_TELEMETRY_INTERVAL      300000
 
 // ==================== PREFERENCES (NVS) ====================
 #define PREFS_NAMESPACE          "eth18ch"
 #define PREFS_RELAY_LOGIC        "relay_logic"
 #define PREFS_INITIAL_STATE      "init_state"
-#define PREFS_RELAY_STATE_PREFIX "relay_"
+#define PREFS_RELAY_STATE_PREFIX "relay_"      // relay_0 … relay_17 (18 saídas)
 #define PREFS_INPUT_MODE_PREFIX  "in_mode_"
 #define PREFS_DEBOUNCE_PREFIX    "debounce_"
 #define PREFS_PULSE_PREFIX       "pulse_"

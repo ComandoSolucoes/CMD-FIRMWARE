@@ -6,77 +6,74 @@
 #include <ArduinoJson.h>
 #include "Config.h"
 
-// Estado de comunicação de um escravo
+// ==================== CONFIG DE CANAL DO ESCRAVO ====================
+// Espelha o ChannelConfig do firmware 8CH-IO
+struct SlaveChannelConfig {
+    uint8_t  mode    = INPUT_MODE_TRANSITION;
+    uint16_t debMs   = DEFAULT_DEBOUNCE_MS;
+    uint16_t pulseMs = DEFAULT_PULSE_MS;
+};
+
+// ==================== STATUS / DADOS DO ESCRAVO ====================
+
 struct SlaveStatus {
-    bool online;               // Escravo respondendo?
-    unsigned long lastContact; // millis() da última comunicação OK
-    uint32_t errorCount;       // Contador de erros consecutivos
-    uint32_t totalErrors;      // Total acumulado de erros
+    bool          online;
+    unsigned long lastContact;
+    uint32_t      errorCount;
+    uint32_t      totalErrors;
 };
 
-// Dados de um escravo (8 entradas + 8 saídas)
 struct SlaveData {
-    bool outputs[NUM_SLAVE_CHANNELS]; // do1-do8 (o que enviamos)
-    bool inputs[NUM_SLAVE_CHANNELS];  // di1-di8 (o que recebemos)
+    bool outputs[NUM_SLAVE_CHANNELS]; // do1-do8 (enviamos)
+    bool inputs [NUM_SLAVE_CHANNELS]; // di1-di8 (recebemos)
 };
 
-// Callback chamado quando uma entrada de escravo muda
 typedef std::function<void(uint8_t slaveIndex, uint8_t inputIndex, bool state)> SlaveInputChangedCallback;
+
+// ==================== CLASSE ====================
 
 class I2CSlaveManager {
 public:
     I2CSlaveManager();
 
-    // Inicializa o barramento I2C e detecta escravos
     void begin();
-
-    // Chamado no loop — executa ciclo de polling para todos os escravos
     void handle();
 
-    // ==================== CONTROLE DE SAÍDAS ====================
-
-    // Define saída de um escravo (slaveIndex: 0 ou 1, outputIndex: 0-7)
+    // Saídas
     void setOutput(uint8_t slaveIndex, uint8_t outputIndex, bool state);
-
-    // Lê saída atual (estado lógico armazenado)
     bool getOutput(uint8_t slaveIndex, uint8_t outputIndex);
 
-    // ==================== LEITURA DE ENTRADAS ====================
-
-    // Lê entrada de um escravo (slaveIndex: 0 ou 1, inputIndex: 0-7)
+    // Entradas
     bool getInput(uint8_t slaveIndex, uint8_t inputIndex);
 
-    // ==================== STATUS ====================
-
-    bool isSlaveOnline(uint8_t slaveIndex);
+    // Status
+    bool        isSlaveOnline(uint8_t slaveIndex);
     SlaveStatus getSlaveStatus(uint8_t slaveIndex);
 
-    // ==================== CALLBACK ====================
-
+    // Callback
     void setInputChangedCallback(SlaveInputChangedCallback cb);
 
+    // ==================== CONFIG PUSH ====================
+    // Agenda envio de configuração completa embutida no próximo JSON de saídas.
+    // Chamado pelo IOManager no boot e ao salvar configuração.
+    void pushConfig(uint8_t slaveIndex, const SlaveChannelConfig cfg[NUM_SLAVE_CHANNELS]);
+
 private:
-    SlaveData   slaveData[NUM_SLAVES];
+    SlaveData   slaveData  [NUM_SLAVES];
     SlaveStatus slaveStatus[NUM_SLAVES];
     unsigned long lastPollTime;
 
     SlaveInputChangedCallback inputChangedCb;
 
-    // Endereços I2C dos escravos
+    // Config pendente para cada escravo
+    bool               pendingConfigPush[NUM_SLAVES];
+    SlaveChannelConfig slaveConfig[NUM_SLAVES][NUM_SLAVE_CHANNELS];
+
     const uint8_t slaveAddresses[NUM_SLAVES] = { I2C_SLAVE1_ADDR, I2C_SLAVE2_ADDR };
 
-    // Executa um ciclo completo de comunicação com um escravo:
-    // 1) Envia outputs em JSON
-    // 2) Solicita e lê inputs em JSON
     bool communicateWithSlave(uint8_t slaveIndex);
-
-    // Serializa outputs para JSON e envia via Wire
     bool sendOutputsJson(uint8_t slaveIndex);
-
-    // Solicita e faz parse dos inputs JSON recebidos
     bool receiveInputsJson(uint8_t slaveIndex);
-
-    // Detecta mudanças nos inputs e dispara callback
     void detectInputChanges(uint8_t slaveIndex, bool previousInputs[NUM_SLAVE_CHANNELS]);
 };
 
