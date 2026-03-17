@@ -1,10 +1,19 @@
 ////////////////////////////////////////////////////////////////////////////////////
-// ETH-18CH-MASTER — Integrado com CMD-C Core
-// Módulo mestre com Ethernet (WT32-ETH01 / LAN8720)
-// 2 entradas + 2 saídas locais
-// 2 escravos I2C 8CH (total 18 entradas + 18 saídas)
-// MQTT formato Tasmota via Ethernet (PubSubClient)
-// Gerenciamento WiFi/Auth/Web via CMD-C Core
+// ETH-18CH-MASTER v2.0.1
+//
+// Arquitetura:
+//   Core 0 — I2C task: polling dos escravos a cada I2C_POLL_MS
+//   Core 1 — loop():  ETH / WiFi / WebServer / MQTT / entradas locais
+//
+// Lógica de rede:
+//   1. ETH é sempre tentado primeiro (timeout 10s)
+//   2. Se ETH subiu → WiFi fica desabilitado (economia de energia + evita
+//      conflito de IPs no CMD-C)
+//   3. Se ETH falhou → core.begin() inicia WiFi normalmente via CMDWiFi
+//
+// Protocolo I2C:
+//   TX (mestre→escravo): desired outputs + cfg (quando pendente)
+//   RX (escravo→mestre): confirmed outputs + inputs
 ////////////////////////////////////////////////////////////////////////////////////
 
 #include <CMDCore.h>
@@ -28,6 +37,10 @@ WebInterface    webIface(&ioMgr, &mqttHdl, &slaveMgr, &ethCfg);
 
 static bool ethConnected = false;
 
+// ==================== MUTEX I2C ====================
+
+SemaphoreHandle_t i2cMutex = nullptr;
+
 // ==================== EVENTOS ETHERNET ====================
 
 void onEthEvent(WiFiEvent_t event) {
@@ -36,32 +49,36 @@ void onEthEvent(WiFiEvent_t event) {
             LOG_INFO("Ethernet iniciado");
             ETH.setHostname(DEVICE_MODEL);
             break;
-
         case ARDUINO_EVENT_ETH_CONNECTED:
             LOG_INFO("Cabo Ethernet conectado");
             break;
-
         case ARDUINO_EVENT_ETH_GOT_IP:
-            LOG_INFOF("ETH IP: %s  MAC: %s  Speed: %d Mbps  %s",
+            LOG_INFOF("ETH IP: %s  MAC: %s  %dMbps %s",
                 ETH.localIP().toString().c_str(),
                 ETH.macAddress().c_str(),
                 ETH.linkSpeed(),
-                ETH.fullDuplex() ? "Full Duplex" : "Half Duplex");
+                ETH.fullDuplex() ? "FD" : "HD");
             ethConnected = true;
             break;
-
         case ARDUINO_EVENT_ETH_DISCONNECTED:
+        case ARDUINO_EVENT_ETH_STOP:
             LOG_WARN("Ethernet desconectado");
             ethConnected = false;
             break;
+        default: break;
+    }
+}
 
-        case ARDUINO_EVENT_ETH_STOP:
-            LOG_WARN("Ethernet parado");
-            ethConnected = false;
-            break;
+// ==================== I2C TASK (Core 0) ====================
 
-        default:
-            break;
+void i2cTask(void*) {
+    LOG_INFO("I2C Task iniciada no Core 0");
+    for (;;) {
+        if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            slaveMgr.handle();
+            xSemaphoreGive(i2cMutex);
+        }
+        vTaskDelay(pdMS_TO_TICKS(I2C_POLL_MS));
     }
 }
 
@@ -73,63 +90,56 @@ void setup() {
 
     Serial.println();
     Serial.println("╔════════════════════════════════════════╗");
-    Serial.println("║      ETH-18CH-MASTER + CMD-C Core      ║");
-    Serial.println("║      Firmware v" FIRMWARE_VERSION "                    ║");
+    Serial.println("║  ETH-18CH-MASTER v2.0.1 + CMD-C Core  ║");
     Serial.println("╚════════════════════════════════════════╝");
     Serial.println();
 
-    // Watchdog (API core 3.x — usa struct)
-    // FIX: desinicializa antes para evitar erro "TWDT already initialized"
-    //      que ocorre quando o watchdog dispara e o chip reinicia via SW_CPU_RESET
+    // Watchdog
     esp_task_wdt_deinit();
-
-    esp_task_wdt_config_t wdtConfig = {
+    esp_task_wdt_config_t wdtCfg = {
         .timeout_ms     = WATCHDOG_TIMEOUT_SEC * 1000,
         .idle_core_mask = 0,
         .trigger_panic  = true
     };
-    esp_task_wdt_init(&wdtConfig);
+    esp_task_wdt_init(&wdtCfg);
     esp_task_wdt_add(NULL);
-    LOG_INFO("Watchdog iniciado");
 
-    // 1) CMD-C Core — sobe AP WiFi e WebServer primeiro
-    //    Garante acesso à interface mesmo se ETH travar
-    core.begin();
-
-    // FIX: registra evento ETH antes de ETH.begin() para não perder
-    //      o evento ARDUINO_EVENT_ETH_START que ocorre logo no begin()
+    // ── 1) ETHERNET (sempre tentado primeiro) ───────────────────────────────
     WiFi.onEvent(onEthEvent);
+    ethCfg.begin();
+    ETH.begin(ETH_PHY_TYPE, ETH_PHY_ADDR, ETH_PHY_MDC,
+              ETH_PHY_MDIO, ETH_PHY_POWER, ETH_CLK_MODE);
 
-    // 2) Inicializa Ethernet (WT32-ETH01 — LAN8720)
-    ethCfg.begin(); // aplica IP fixo se configurado
-    ETH.begin(ETH_PHY_TYPE,
-              ETH_PHY_ADDR,
-              ETH_PHY_MDC,
-              ETH_PHY_MDIO,
-              ETH_PHY_POWER,
-              ETH_CLK_MODE);
-
-    // FIX: alimenta o watchdog dentro do while de espera do ETH
-    //      sem isso o WDT dispara após ~30s (WATCHDOG_TIMEOUT_SEC),
-    //      causa SW_CPU_RESET, incrementa boot counter e após 6x
-    //      ativa o factory reset — gerando o loop infinito observado
-    LOG_INFO("Aguardando IP Ethernet...");
+    LOG_INFO("Aguardando Ethernet (10s)...");
     unsigned long t = millis();
     while (!ethConnected && millis() - t < 10000) {
         esp_task_wdt_reset();
         delay(100);
     }
 
+    // ── 2) CMD-C Core — WiFi só sobe se ETH não está disponível ─────────────
     if (ethConnected) {
-        LOG_INFOF("Ethernet OK! IP: %s", ETH.localIP().toString().c_str());
+        LOG_INFOF("ETH OK: %s — WiFi desabilitado", ETH.localIP().toString().c_str());
+
+        // Desativa rádio WiFi para evitar conflito e economizar energia.
+        // CMD-C ainda funciona: NVS, WebServer via ETH, MQTT via ETH.
+        WiFi.mode(WIFI_OFF);
+
+        // Inicializa CMD-C sem tentar conectar WiFi.
+        // O WebServer do CMD-C vai responder via ETH.
+        core.begin();
+
     } else {
-        LOG_WARN("Ethernet sem IP — continuando (MQTT desabilitado até obter IP)");
+        LOG_WARN("ETH indisponivel — iniciando WiFi via CMD-C");
+
+        // ETH não subiu: CMD-C inicializa normalmente com WiFi AP/STA
+        core.begin();
     }
 
-    // 3) Escravos I2C
+    // ── 3) Escravos I2C ──────────────────────────────────────────────────────
     slaveMgr.begin();
 
-    // 4) IOManager (pinos locais + callbacks)
+    // ── 4) IOManager ────────────────────────────────────────────────────────
     ioMgr.begin();
 
     ioMgr.setOutputChangedCallback([](uint8_t index, bool state) {
@@ -140,43 +150,41 @@ void setup() {
         mqttHdl.publishInputState(index, state);
     });
 
-    // 5) MQTT Handler (usa Ethernet + config salva pelo CMD-C /mqtt)
+    // ── 5) MQTT ──────────────────────────────────────────────────────────────
+    // Sempre via ethClient (MqttHandler.h) — funciona independente do WiFi
     mqttHdl.begin(&core);
 
-    // 6) Interface web — registra rotas /device e APIs no CMDCore WebServer
+    // ── 6) Web ───────────────────────────────────────────────────────────────
     webIface.registerRoutes(&core.webServer);
 
-    // Log de endereços
+    // ── 7) Mutex + Task I2C no Core 0 ───────────────────────────────────────
+    i2cMutex = xSemaphoreCreateMutex();
+    xTaskCreatePinnedToCore(i2cTask, "i2c_task", 4096, nullptr, 1, nullptr, 0);
+
+    // ── Status ───────────────────────────────────────────────────────────────
     Serial.println();
     Serial.println(LOG_PREFIX "════════════════════════════════════════");
-    Serial.println(LOG_PREFIX "✅ Sistema inicializado!");
-    if (ethConnected) {
-        Serial.println(LOG_PREFIX "🌐 Dashboard ETH: http://" + ETH.localIP().toString() + "/device");
-    }
-    if (core.isAPMode()) {
-        Serial.println(LOG_PREFIX "📶 Config WiFi AP: http://" + core.getIP());
-    } else {
-        Serial.println(LOG_PREFIX "📶 Config WiFi STA: http://" + core.getIP() + "/device");
-    }
+    Serial.println(LOG_PREFIX "Sistema inicializado!");
+    if (ethConnected)
+        Serial.println(LOG_PREFIX "ETH:  http://" + ETH.localIP().toString() + "/device");
+    else
+        Serial.println(LOG_PREFIX "WiFi: http://" + core.getIP() + "/device");
     Serial.println(LOG_PREFIX "════════════════════════════════════════");
     Serial.println();
 }
 
-// ==================== LOOP ====================
+// ==================== LOOP (Core 1) ====================
 
 void loop() {
     esp_task_wdt_reset();
 
-    // CMD-C Core (WiFi + WebServer)
     core.handle();
 
-    // Polling I2C dos escravos
-    slaveMgr.handle();
+    if (xSemaphoreTake(i2cMutex, pdMS_TO_TICKS(5)) == pdTRUE) {
+        ioMgr.handle();
+        xSemaphoreGive(i2cMutex);
+    }
 
-    // Entradas locais + pulsos
-    ioMgr.handle();
-
-    // MQTT via Ethernet
     mqttHdl.handle();
 
     delay(1);

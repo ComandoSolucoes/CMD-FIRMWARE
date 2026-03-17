@@ -1,47 +1,43 @@
 ////////////////////////////////////////////////////////////////////////////////////
-// ESP32-8CH-CONTROLADO — Escravo I2C para ETH-18CH-MASTER
+// ESP32-8CH-SLAVE — Firmware Monolítico v1.0.4
 //
-// Recebe do mestre (JSON):
-//   Saídas:  {"do1":1,"do2":0,...,"do8":0}
-//   Config:  {"do1":1,..., "cfg":{"in1":{"mode":1,"deb":50,"pulse":500},...}}
-//            (campo "cfg" é opcional — só enviado quando o mestre quiser configurar)
+// FIX v1.0.4: onI2CReceive() faz APENAS cópia de bytes.
+//   Alocar JsonDocument dentro da callback Wire causa stack overflow
+//   (a task Wire tem stack reduzida). Todo processamento vai para loop().
 //
-// Envia ao mestre (JSON):
-//   Entradas: {"di1":1,"di2":0,...,"di8":0}  ← estado debounced de cada canal
+//   Para garantir que onI2CRequest() sirva txBuffer atualizado mesmo com
+//   o mestre fazendo endTransmission()+requestFrom() em sequência:
+//   → processamento do rxBuffer é feito no INÍCIO do loop(), antes de
+//     qualquer delay(), com prioridade máxima.
+//   → txBuffer é atualizado imediatamente após aplicar os outputs.
+//   → O mestre pode ter 1 ciclo de "stale" no pior caso, mas com o
+//     modelo desired/confirmed do novo mestre isso é tolerado.
 //
-// Modos de entrada (campo "mode"):
-//   0 = DISABLED   — não processa, só reporta estado
-//   1 = TRANSITION — toggle no relé correspondente a cada borda de subida
-//   2 = PULSE      — liga o relé por "pulse" ms na borda de subida
-//   3 = FOLLOW     — relé segue o estado da entrada
-//   4 = INVERTED   — relé é o inverso da entrada
-//
-// ENDEREÇO I2C: altere I2C_SLAVE_ADDR conforme jumper/posição
-//   Escravo 1 → 0x55
-//   Escravo 2 → 0x56
+// ⚠️  Para o 2º escravo: altere I2C_SLAVE_ADDR para 0x56
 ////////////////////////////////////////////////////////////////////////////////////
 
 #include <Arduino.h>
 #include <Wire.h>
-#include <Preferences.h>
 #include <ArduinoJson.h>
+#include <Preferences.h>
+#include <esp_task_wdt.h>
 
-// ==================== CONFIGURAÇÃO ====================
+#define FIRMWARE_VERSION      "1.0.5"
+#define DEVICE_MODEL          "8CH-SLAVE"
 
-#define I2C_SLAVE_ADDR   0x55
-#define I2C_SDA_PIN      21
-#define I2C_SCL_PIN      22
+#define I2C_SLAVE_ADDR        0x55
+#define I2C_SDA_PIN           21
+#define I2C_SCL_PIN           22
+#define I2C_BUF_SIZE          512
 
-#define NUM_CHANNELS     8
-#define PREFS_NAMESPACE  "8ch-ctrl"
+#define NUM_CHANNELS          8
 
-// Pinos de saída (relés)
-const uint8_t OUTPUT_PINS[NUM_CHANNELS] = { 19, 18, 17, 16, 4, 27, 12, 13 };
+// Tempo que o escravo ignora o mestre após acionamento físico.
+// Deve cobrir pelo menos 2 ciclos I2C do mestre (I2C_POLL_MS=20ms).
+#define LOCAL_OVERRIDE_MS     200
 
-// Pinos de entrada
-const uint8_t INPUT_PINS[NUM_CHANNELS]  = { 36, 39, 34, 35, 32, 33, 25, 26 };
-
-// ==================== MODOS DE ENTRADA ====================
+const uint8_t OUTPUT_PINS[NUM_CHANNELS] = { 19, 18, 17, 16,  4, 27, 12, 13 };
+const uint8_t INPUT_PINS [NUM_CHANNELS] = { 36, 39, 34, 35, 32, 33, 25, 26 };
 
 enum InputMode : uint8_t {
     INPUT_MODE_DISABLED   = 0,
@@ -51,222 +47,83 @@ enum InputMode : uint8_t {
     INPUT_MODE_INVERTED   = 4
 };
 
-// ==================== CONFIGURAÇÃO POR CANAL ====================
+enum RelayLogic : uint8_t {
+    RELAY_LOGIC_NORMAL   = 0,
+    RELAY_LOGIC_INVERTED = 1
+};
 
 struct ChannelConfig {
-    InputMode mode    = INPUT_MODE_DISABLED;
+    InputMode mode    = INPUT_MODE_TRANSITION;
     uint16_t  debMs   = 50;
     uint16_t  pulseMs = 500;
 };
 
+#define LOG_PREFIX "[8CH-SLAVE] "
+#define LOG_INFO(m)         Serial.println(LOG_PREFIX m)
+#define LOG_INFOF(f, ...)   Serial.printf(LOG_PREFIX f "\n", ##__VA_ARGS__)
+#define LOG_WARN(m)         Serial.println(LOG_PREFIX "! " m)
+
+#define WATCHDOG_TIMEOUT_SEC  30
+#define PREFS_NAMESPACE       "8ch-slave"
+
 // ==================== ESTADO GLOBAL ====================
 
-bool outputStates[NUM_CHANNELS] = {};
-bool inputStates[NUM_CHANNELS]  = {};
+bool          outputStates      [NUM_CHANNELS] = {};
+RelayLogic    relayLogic                       = RELAY_LOGIC_NORMAL;
+bool          inputStates       [NUM_CHANNELS] = {};
+bool          lastInputRaw      [NUM_CHANNELS] = {};
+uint32_t      debounceTimer     [NUM_CHANNELS] = {};
+uint32_t      pulseTimer        [NUM_CHANNELS] = {};
+ChannelConfig channelCfg        [NUM_CHANNELS];
 
-bool     lastRawInput[NUM_CHANNELS]  = {};
-uint32_t debounceTimer[NUM_CHANNELS] = {};
+// Override local — impede mestre de sobrescrever acionamento físico
+bool     localOverride      [NUM_CHANNELS] = {};
+uint32_t localOverrideTimer [NUM_CHANNELS] = {};
 
-bool     pulseActive[NUM_CHANNELS] = {};
-uint32_t pulseStart[NUM_CHANNELS]  = {};
+// ==================== BUFFERS I2C ====================
+// rxBuffer: preenchido na ISR (apenas cópia de bytes)
+// txBuffer: lido pela ISR onI2CRequest
+// rxReady:  flag atômica ISR→loop
 
-ChannelConfig chanCfg[NUM_CHANNELS];
+volatile char     rxBuffer[I2C_BUF_SIZE];
+volatile bool     rxReady = false;
 
-// Buffer I2C
-volatile bool newDataReceived = false;
-char          rxBuffer[512]   = {};
-uint16_t      rxLen           = 0;
-
-// NVS: escrita adiada para não bloquear o barramento I2C
-bool     nvsDirtyStates = false;
-bool     nvsDirtyConfig = false;
-uint32_t nvsWriteAfter  = 0;          // millis() a partir do qual pode gravar
-#define  NVS_WRITE_DELAY_MS  200      // aguarda 200ms de inatividade no I2C
+char     txBuffer[300];
+uint16_t txLen = 0;
 
 Preferences prefs;
 
 // ==================== PROTÓTIPOS ====================
 
-void onReceive(int numBytes);
-void onRequest();
-void processReceivedJson();
-void parseConfig(JsonObject cfg);
-void processInput(uint8_t ch, bool newState);
-void setOutput(uint8_t ch, bool state);
+void applyOutputHardware(uint8_t index, bool state);
+void setOutputLocal(uint8_t index, bool state);
+void toggleOutputLocal(uint8_t index);
+void buildTxJson();
+void processRxBuffer();
+void applyOutputsFromBuffer(JsonDocument& doc);
+void processCfgFromBuffer(JsonDocument& doc);
+void handleInputs();
+void processInput(uint8_t index, bool rawState);
+void applyInitialOutputs();
 void saveConfig();
 void saveOutputStates();
 void loadConfig();
 
-// ==================== CALLBACKS I2C ====================
+// ==================== I2C CALLBACKS ====================
+// REGRA: callbacks Wire têm stack limitada.
+// onI2CReceive → APENAS copia bytes, seta flag.
+// onI2CRequest → APENAS escreve txBuffer já preparado pelo loop().
 
-void onReceive(int numBytes) {
-    uint16_t len = 0;
-    while (Wire.available() && len < (uint16_t)(sizeof(rxBuffer) - 1)) {
-        rxBuffer[len++] = (char)Wire.read();
-    }
-    rxBuffer[len] = '\0';
-    rxLen = len;
-    newDataReceived = true;
+void onI2CReceive(int numBytes) {
+    uint16_t i = 0;
+    while (Wire.available() && i < (I2C_BUF_SIZE - 1))
+        rxBuffer[i++] = (char)Wire.read();
+    rxBuffer[i] = '\0';
+    rxReady = true;
 }
 
-void onRequest() {
-    JsonDocument doc;
-    for (uint8_t i = 0; i < NUM_CHANNELS; i++) {
-        char key[5];
-        snprintf(key, sizeof(key), "di%d", i + 1);
-        doc[key] = inputStates[i] ? 1 : 0;
-    }
-    String out;
-    serializeJson(doc, out);
-    Wire.print(out);
-}
-
-// ==================== PROCESSAMENTO DO JSON ====================
-
-void processReceivedJson() {
-    char* start = strchr(rxBuffer, '{');
-    if (!start) return;
-
-    JsonDocument doc;
-    DeserializationError err = deserializeJson(doc, start);
-    if (err) {
-        Serial.printf("[CTRL] Erro JSON: %s\n", err.c_str());
-        return;
-    }
-
-    // 1) Atualiza saídas (do1–do8)
-    bool outputChanged = false;
-    for (uint8_t i = 0; i < NUM_CHANNELS; i++) {
-        char key[5];
-        snprintf(key, sizeof(key), "do%d", i + 1);
-        if (doc[key].is<int>()) {
-            bool state = doc[key].as<int>() != 0;
-            if (state != outputStates[i]) outputChanged = true;
-            outputStates[i] = state;
-            digitalWrite(OUTPUT_PINS[i], state ? HIGH : LOW);
-        }
-    }
-    if (outputChanged) {
-        nvsDirtyStates = true;
-        nvsWriteAfter  = millis() + NVS_WRITE_DELAY_MS;
-    }
-
-    // 2) Atualiza configuração dos canais (campo "cfg" é opcional)
-    if (doc["cfg"].is<JsonObject>()) {
-        JsonObject cfg = doc["cfg"].as<JsonObject>();
-        parseConfig(cfg);
-        nvsDirtyConfig = true;
-        nvsWriteAfter  = millis() + NVS_WRITE_DELAY_MS;
-
-        Serial.println("[CTRL] Config atualizada e salva:");
-        for (uint8_t i = 0; i < NUM_CHANNELS; i++) {
-            Serial.printf("  in%d → mode=%d  deb=%dms  pulse=%dms\n",
-                i + 1, (uint8_t)chanCfg[i].mode,
-                chanCfg[i].debMs, chanCfg[i].pulseMs);
-        }
-    }
-
-    Serial.print("[CTRL] Saidas: ");
-    for (uint8_t i = 0; i < NUM_CHANNELS; i++) Serial.print(outputStates[i] ? "1" : "0");
-    Serial.println();
-}
-
-void parseConfig(JsonObject cfg) {
-    for (uint8_t i = 0; i < NUM_CHANNELS; i++) {
-        char key[5];
-        snprintf(key, sizeof(key), "in%d", i + 1);
-        if (!cfg[key].is<JsonObject>()) continue;
-        JsonObject ch = cfg[key].as<JsonObject>();
-
-        if (ch["mode"].is<uint8_t>()) {
-            uint8_t m = ch["mode"].as<uint8_t>();
-            if (m <= (uint8_t)INPUT_MODE_INVERTED) chanCfg[i].mode = (InputMode)m;
-        }
-        if (ch["deb"].is<int>())   chanCfg[i].debMs   = (uint16_t)constrain(ch["deb"].as<int>(),   10,   1000);
-        if (ch["pulse"].is<int>()) chanCfg[i].pulseMs = (uint16_t)constrain(ch["pulse"].as<int>(), 50, 10000);
-    }
-}
-
-// ==================== LÓGICA DE ENTRADA ====================
-
-void processInput(uint8_t ch, bool newState) {
-    bool prevState  = inputStates[ch];
-    inputStates[ch] = newState;
-    bool risingEdge = newState && !prevState;
-
-    Serial.printf("[CTRL] IN%d: %s → %s\n",
-        ch + 1, prevState ? "ON" : "OFF", newState ? "ON" : "OFF");
-
-    switch (chanCfg[ch].mode) {
-        case INPUT_MODE_DISABLED:
-            break;
-
-        case INPUT_MODE_TRANSITION:
-            if (risingEdge) setOutput(ch, !outputStates[ch]);
-            break;
-
-        case INPUT_MODE_PULSE:
-            if (risingEdge) {
-                setOutput(ch, true);
-                pulseActive[ch] = true;
-                pulseStart[ch]  = millis();
-            }
-            break;
-
-        case INPUT_MODE_FOLLOW:
-            setOutput(ch, newState);
-            break;
-
-        case INPUT_MODE_INVERTED:
-            setOutput(ch, !newState);
-            break;
-    }
-}
-
-void setOutput(uint8_t ch, bool state) {
-    if (ch >= NUM_CHANNELS) return;
-    outputStates[ch] = state;
-    digitalWrite(OUTPUT_PINS[ch], state ? HIGH : LOW);
-    nvsDirtyStates = true;
-    nvsWriteAfter  = millis() + NVS_WRITE_DELAY_MS;
-    Serial.printf("[CTRL] OUT%d → %s\n", ch + 1, state ? "ON" : "OFF");
-}
-
-// ==================== PERSISTÊNCIA ====================
-
-void saveOutputStates() {
-    prefs.begin(PREFS_NAMESPACE, false);
-    for (uint8_t i = 0; i < NUM_CHANNELS; i++) {
-        char key[8];
-        snprintf(key, sizeof(key), "out%d", i);
-        prefs.putBool(key, outputStates[i]);
-    }
-    prefs.end();
-}
-
-void saveConfig() {
-    prefs.begin(PREFS_NAMESPACE, false);
-    for (uint8_t i = 0; i < NUM_CHANNELS; i++) {
-        char key[12];
-        snprintf(key, sizeof(key), "mode%d",  i); prefs.putUChar(key,  (uint8_t)chanCfg[i].mode);
-        snprintf(key, sizeof(key), "deb%d",   i); prefs.putUShort(key, chanCfg[i].debMs);
-        snprintf(key, sizeof(key), "pulse%d", i); prefs.putUShort(key, chanCfg[i].pulseMs);
-    }
-    prefs.end();
-}
-
-void loadConfig() {
-    prefs.begin(PREFS_NAMESPACE, true);
-    for (uint8_t i = 0; i < NUM_CHANNELS; i++) {
-        char key[12];
-        snprintf(key, sizeof(key), "mode%d",  i); chanCfg[i].mode    = (InputMode)prefs.getUChar(key,  INPUT_MODE_TRANSITION);
-        snprintf(key, sizeof(key), "deb%d",   i); chanCfg[i].debMs   = prefs.getUShort(key, 50);
-        snprintf(key, sizeof(key), "pulse%d", i); chanCfg[i].pulseMs = prefs.getUShort(key, 500);
-        // Restaura último estado do relé
-        char ks[8];
-        snprintf(ks, sizeof(ks), "out%d", i);     outputStates[i]    = prefs.getBool(ks, false);
-    }
-    prefs.end();
+void onI2CRequest() {
+    Wire.write((const uint8_t*)txBuffer, txLen);
 }
 
 // ==================== SETUP ====================
@@ -274,84 +131,270 @@ void loadConfig() {
 void setup() {
     Serial.begin(115200);
     delay(300);
-
     Serial.println();
-    Serial.println("╔════════════════════════════════════════╗");
-    Serial.println("║   ESP32-8CH-CONTROLADO — Escravo I2C  ║");
-    Serial.printf ("║   Endereço: 0x%02X                       ║\n", I2C_SLAVE_ADDR);
-    Serial.println("╚════════════════════════════════════════╝");
+    Serial.println("=====================================");
+    Serial.printf("[%s] Firmware v%s  addr=0x%02X\n",
+                  DEVICE_MODEL, FIRMWARE_VERSION, I2C_SLAVE_ADDR);
+    Serial.println("=====================================\n");
+
+    esp_task_wdt_deinit();
+    esp_task_wdt_config_t wdtCfg = {
+        .timeout_ms     = WATCHDOG_TIMEOUT_SEC * 1000,
+        .idle_core_mask = 0,
+        .trigger_panic  = true
+    };
+    esp_task_wdt_init(&wdtCfg);
+    esp_task_wdt_add(NULL);
 
     for (uint8_t i = 0; i < NUM_CHANNELS; i++) {
-        digitalWrite(OUTPUT_PINS[i], LOW);
         pinMode(OUTPUT_PINS[i], OUTPUT);
-        outputStates[i] = false;
+        digitalWrite(OUTPUT_PINS[i], LOW);
     }
-
     for (uint8_t i = 0; i < NUM_CHANNELS; i++) {
-        pinMode(INPUT_PINS[i], INPUT);
-        bool raw        = digitalRead(INPUT_PINS[i]);
-        lastRawInput[i] = raw;
-        inputStates[i]  = raw;
+        uint8_t pin    = INPUT_PINS[i];
+        bool inputOnly = (pin==36||pin==39||pin==34||pin==35);
+        pinMode(pin, inputOnly ? INPUT : INPUT_PULLUP);
+        lastInputRaw[i] = digitalRead(pin);
+        inputStates[i]  = lastInputRaw[i];
     }
 
     loadConfig();
-    // Aplica estados restaurados nos relés (funciona mesmo sem mestre)
-    for (uint8_t i = 0; i < NUM_CHANNELS; i++) {
-        digitalWrite(OUTPUT_PINS[i], outputStates[i] ? HIGH : LOW);
-    }
-    Serial.println("[CTRL] Configuração e estados restaurados da NVS:");
-    for (uint8_t i = 0; i < NUM_CHANNELS; i++) {
-        Serial.printf("  in%d → mode=%d  deb=%dms  pulse=%dms  |  out%d → %s\n",
-            i + 1, (uint8_t)chanCfg[i].mode, chanCfg[i].debMs, chanCfg[i].pulseMs,
-            i + 1, outputStates[i] ? "ON" : "OFF");
-    }
+    applyInitialOutputs();
 
-    Wire.setBufferSize(512); // JSON com cfg ~420 bytes — buffer padrao (128) e insuficiente
+    Wire.setBufferSize(I2C_BUF_SIZE);
     Wire.setPins(I2C_SDA_PIN, I2C_SCL_PIN);
-    Wire.begin(I2C_SLAVE_ADDR);
-    Wire.onReceive(onReceive);
-    Wire.onRequest(onRequest);
+    Wire.begin((uint8_t)I2C_SLAVE_ADDR);
+    Wire.onReceive(onI2CReceive);
+    Wire.onRequest(onI2CRequest);
 
-    Serial.println("[CTRL] Pronto — aguardando mestre...");
+    buildTxJson();  // txBuffer inicial antes do mestre chegar
+    LOG_INFO("Pronto - aguardando mestre...\n");
 }
 
 // ==================== LOOP ====================
 
 void loop() {
-    uint32_t now = millis();
+    esp_task_wdt_reset();
 
-    // 1) Processa JSON recebido (fora do callback — seguro para Serial/JSON)
-    if (newDataReceived) {
-        newDataReceived = false;
-        processReceivedJson();
+    // 1) Processa RX — PRIMEIRO, antes de qualquer delay
+    //    Garante que txBuffer seja atualizado o mais rápido possível
+    //    para o próximo onI2CRequest
+    if (rxReady) {
+        rxReady = false;
+        processRxBuffer();
     }
 
-    // 2) Debounce das entradas físicas
+    // 2) Expira localOverride
+    uint32_t now = millis();
+    for (uint8_t i = 0; i < NUM_CHANNELS; i++) {
+        if (localOverride[i] && (now - localOverrideTimer[i]) >= LOCAL_OVERRIDE_MS) {
+            localOverride[i] = false;
+        }
+    }
+
+    // 3) Entradas físicas
+    handleInputs();
+
+    delay(1);
+}
+
+// ==================== PROCESSA RX ====================
+
+void processRxBuffer() {
+    JsonDocument doc;
+    if (deserializeJson(doc, (const char*)rxBuffer) != DeserializationError::Ok) {
+        LOG_WARN("JSON invalido no rxBuffer");
+        return;
+    }
+
+    // Aplica outputs — respeita localOverride
+    applyOutputsFromBuffer(doc);
+
+    // Reconstrói txBuffer com estado atualizado
+    buildTxJson();
+
+    // Processa cfg se presente (salva na NVS)
+    if (doc["cfg"].is<JsonObject>()) {
+        processCfgFromBuffer(doc);
+    }
+}
+
+// ==================== APPLY OUTPUTS ====================
+
+void applyOutputsFromBuffer(JsonDocument& doc) {
+    for (uint8_t i = 0; i < NUM_CHANNELS; i++) {
+        // Canal protegido por acionamento físico — ignora comando do mestre
+        if (localOverride[i]) continue;
+
+        String key = "do" + String(i + 1);
+        if (doc[key].is<int>()) {
+            bool newState = doc[key].as<int>() != 0;
+            if (newState != outputStates[i]) {
+                outputStates[i] = newState;
+                applyOutputHardware(i, newState);
+            }
+        }
+    }
+}
+
+// ==================== PROCESS CFG ====================
+
+void processCfgFromBuffer(JsonDocument& doc) {
+    JsonObject cfg  = doc["cfg"].as<JsonObject>();
+    bool cfgChanged = false;
+
+    for (uint8_t i = 0; i < NUM_CHANNELS; i++) {
+        String key = "in" + String(i + 1);
+        if (!cfg[key].is<JsonObject>()) continue;
+        JsonObject ch = cfg[key].as<JsonObject>();
+        if (ch["mode"].is<int>())
+            channelCfg[i].mode    = (InputMode)ch["mode"].as<int>();
+        if (ch["deb"].is<int>())
+            channelCfg[i].debMs   = constrain(ch["deb"].as<int>(),   10, 1000);
+        if (ch["pulse"].is<int>())
+            channelCfg[i].pulseMs = constrain(ch["pulse"].as<int>(), 50, 10000);
+        cfgChanged = true;
+    }
+
+    if (cfgChanged) {
+        saveConfig();
+        LOG_INFO("Config atualizada e salva");
+        for (uint8_t i = 0; i < NUM_CHANNELS; i++)
+            LOG_INFOF("  CH%d: mode=%d deb=%dms pulse=%dms",
+                i+1, channelCfg[i].mode, channelCfg[i].debMs, channelCfg[i].pulseMs);
+    }
+}
+
+// ==================== TX ====================
+
+void buildTxJson() {
+    JsonDocument doc;
+    for (uint8_t i = 0; i < NUM_CHANNELS; i++) {
+        doc["di" + String(i+1)] = inputStates[i]  ? 1 : 0;
+        doc["do" + String(i+1)] = outputStates[i] ? 1 : 0;
+    }
+    txLen = serializeJson(doc, txBuffer, sizeof(txBuffer));
+}
+
+// ==================== SAIDAS ====================
+
+void applyOutputHardware(uint8_t index, bool state) {
+    bool level = (relayLogic == RELAY_LOGIC_INVERTED) ? !state : state;
+    digitalWrite(OUTPUT_PINS[index], level ? HIGH : LOW);
+}
+
+// Acionamento local (botão físico) — ativa override
+void setOutputLocal(uint8_t index, bool state) {
+    if (index >= NUM_CHANNELS) return;
+    outputStates[index]       = state;
+    localOverride[index]      = true;
+    localOverrideTimer[index] = millis();
+    applyOutputHardware(index, state);
+}
+
+void toggleOutputLocal(uint8_t index) {
+    if (index >= NUM_CHANNELS) return;
+    setOutputLocal(index, !outputStates[index]);
+}
+
+// ==================== ENTRADAS ====================
+
+void handleInputs() {
+    uint32_t now = millis();
     for (uint8_t i = 0; i < NUM_CHANNELS; i++) {
         bool raw = digitalRead(INPUT_PINS[i]);
-        if (raw != lastRawInput[i]) {
-            lastRawInput[i]  = raw;
+        if (raw != lastInputRaw[i]) {
+            lastInputRaw[i]  = raw;
             debounceTimer[i] = now;
         }
-        if ((now - debounceTimer[i]) >= chanCfg[i].debMs) {
-            if (raw != inputStates[i]) processInput(i, raw);
+        if ((now - debounceTimer[i]) >= channelCfg[i].debMs && raw != inputStates[i])
+            processInput(i, raw);
+
+        if (pulseTimer[i] > 0 && (now - pulseTimer[i]) >= channelCfg[i].pulseMs) {
+            pulseTimer[i] = 0;
+            setOutputLocal(i, false);
+            buildTxJson();
         }
     }
+}
 
-    // 3) Expiração de pulsos ativos
+void processInput(uint8_t index, bool rawState) {
+    bool prevState     = inputStates[index];
+    inputStates[index] = rawState;
+    buildTxJson();
+
+    if (channelCfg[index].mode == INPUT_MODE_DISABLED) return;
+    bool risingEdge = rawState && !prevState;
+
+    switch (channelCfg[index].mode) {
+        case INPUT_MODE_TRANSITION:
+            if (risingEdge) { toggleOutputLocal(index); buildTxJson(); }
+            break;
+        case INPUT_MODE_PULSE:
+            if (risingEdge) {
+                setOutputLocal(index, true);
+                pulseTimer[index] = millis();
+                buildTxJson();
+            }
+            break;
+        case INPUT_MODE_FOLLOW:
+            setOutputLocal(index, rawState);  buildTxJson();
+            break;
+        case INPUT_MODE_INVERTED:
+            setOutputLocal(index, !rawState); buildTxJson();
+            break;
+        default: break;
+    }
+}
+
+// ==================== ESTADO INICIAL ====================
+
+void applyInitialOutputs() {
+    for (uint8_t i = 0; i < NUM_CHANNELS; i++)
+        applyOutputHardware(i, outputStates[i]);
+    LOG_INFO("Estados restaurados da NVS");
+}
+
+// ==================== NVS ====================
+
+void saveConfig() {
+    prefs.begin(PREFS_NAMESPACE, false);
+    prefs.putUChar("relay_logic", (uint8_t)relayLogic);
     for (uint8_t i = 0; i < NUM_CHANNELS; i++) {
-        if (pulseActive[i] && (now - pulseStart[i]) >= chanCfg[i].pulseMs) {
-            pulseActive[i] = false;
-            setOutput(i, false);
-        }
+        char k[20];
+        snprintf(k,sizeof(k),"mode_%d", i);  prefs.putUChar (k,(uint8_t)channelCfg[i].mode);
+        snprintf(k,sizeof(k),"deb_%d",  i);  prefs.putUShort(k,channelCfg[i].debMs);
+        snprintf(k,sizeof(k),"pulse_%d",i);  prefs.putUShort(k,channelCfg[i].pulseMs);
+        snprintf(k,sizeof(k),"out_%d",  i);  prefs.putBool  (k,outputStates[i]);
     }
+    prefs.end();
+}
 
-    // 4) Flush NVS adiado — só grava após NVS_WRITE_DELAY_MS de inatividade
-    //    Evita bloquear o barramento I2C durante escritas na flash
-    if ((nvsDirtyStates || nvsDirtyConfig) && (millis() >= nvsWriteAfter)) {
-        if (nvsDirtyStates) { saveOutputStates(); nvsDirtyStates = false; }
-        if (nvsDirtyConfig) { saveConfig();       nvsDirtyConfig = false; }
+void saveOutputStates() {
+    prefs.begin(PREFS_NAMESPACE, false);
+    for (uint8_t i = 0; i < NUM_CHANNELS; i++) {
+        char k[20];
+        snprintf(k,sizeof(k),"out_%d",i);
+        prefs.putBool(k,outputStates[i]);
     }
+    prefs.end();
+}
 
-    delay(5);
+void loadConfig() {
+    prefs.begin(PREFS_NAMESPACE, true);
+    relayLogic = (RelayLogic)prefs.getUChar("relay_logic", RELAY_LOGIC_NORMAL);
+    for (uint8_t i = 0; i < NUM_CHANNELS; i++) {
+        char k[20];
+        snprintf(k,sizeof(k),"mode_%d", i); channelCfg[i].mode    = (InputMode)prefs.getUChar (k,INPUT_MODE_TRANSITION);
+        snprintf(k,sizeof(k),"deb_%d",  i); channelCfg[i].debMs   =            prefs.getUShort(k,50);
+        snprintf(k,sizeof(k),"pulse_%d",i); channelCfg[i].pulseMs =            prefs.getUShort(k,500);
+        snprintf(k,sizeof(k),"out_%d",  i); outputStates[i]       =            prefs.getBool  (k,false);
+    }
+    prefs.end();
+    LOG_INFO("Config carregada da NVS:");
+    for (uint8_t i = 0; i < NUM_CHANNELS; i++)
+        LOG_INFOF("  CH%d: mode=%d deb=%3dms pulse=%4dms out=%s",
+            i+1,(uint8_t)channelCfg[i].mode,
+            channelCfg[i].debMs,channelCfg[i].pulseMs,
+            outputStates[i]?"ON":"OFF");
 }

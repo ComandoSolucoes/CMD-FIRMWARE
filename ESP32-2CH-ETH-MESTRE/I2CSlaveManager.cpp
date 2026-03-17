@@ -1,28 +1,48 @@
 #include "I2CSlaveManager.h"
 
 I2CSlaveManager::I2CSlaveManager()
-    : lastPollTime(0), inputChangedCb(nullptr) {
+    : lastPollTime(0), outputChangedCb(nullptr), inputChangedCb(nullptr) {
 
     for (uint8_t s = 0; s < NUM_SLAVES; s++) {
-        slaveStatus[s].online      = false;
-        slaveStatus[s].lastContact = 0;
-        slaveStatus[s].errorCount  = 0;
-        slaveStatus[s].totalErrors = 0;
-        pendingConfigPush[s]       = false;
+        slaveStatus[s]       = { false, 0, 0, 0 };
+        pendingConfigPush[s] = false;
 
-        for (uint8_t i = 0; i < NUM_SLAVE_CHANNELS; i++) {
-            slaveData[s].outputs[i] = false;
-            slaveData[s].inputs[i]  = false;
-            slaveConfig[s][i]       = SlaveChannelConfig{};
+        for (uint8_t c = 0; c < NUM_SLAVE_CHANNELS; c++) {
+            slaveData[s].desired  [c] = false;
+            slaveData[s].confirmed[c] = false;
+            slaveData[s].inputs   [c] = false;
+            slaveConfig[s][c]         = SlaveChannelConfig{};
         }
     }
 }
 
+// ==================== BEGIN ====================
+
 void I2CSlaveManager::begin() {
     LOG_INFO("Inicializando I2C Slave Manager...");
 
-    // IMPORTANTE: setBufferSize ANTES de Wire.begin()
-    // O JSON com cfg completo pode chegar a ~420 bytes
+    // Bus Recovery — libera SDA caso mestre tenha resetado durante transação
+    pinMode(I2C_SDA_PIN, INPUT_PULLUP);
+    pinMode(I2C_SCL_PIN, OUTPUT);
+
+    bool sdaFree = digitalRead(I2C_SDA_PIN);
+    if (!sdaFree) {
+        LOG_WARN("I2C: SDA preso — iniciando bus recovery...");
+        for (uint8_t pulse = 0; pulse < 9 && !digitalRead(I2C_SDA_PIN); pulse++) {
+            digitalWrite(I2C_SCL_PIN, LOW);  delayMicroseconds(5);
+            digitalWrite(I2C_SCL_PIN, HIGH); delayMicroseconds(5);
+        }
+        pinMode(I2C_SDA_PIN, OUTPUT);
+        digitalWrite(I2C_SDA_PIN, LOW);  delayMicroseconds(5);
+        digitalWrite(I2C_SCL_PIN, HIGH); delayMicroseconds(5);
+        digitalWrite(I2C_SDA_PIN, HIGH); delayMicroseconds(5);
+        LOG_INFO("I2C: bus recovery concluido");
+    }
+
+    pinMode(I2C_SDA_PIN, INPUT_PULLUP);
+    pinMode(I2C_SCL_PIN, INPUT_PULLUP);
+    delay(10);
+
     Wire.setBufferSize(I2C_BUF_SIZE);
     Wire.setPins(I2C_SDA_PIN, I2C_SCL_PIN);
     Wire.begin();
@@ -31,18 +51,15 @@ void I2CSlaveManager::begin() {
     for (uint8_t s = 0; s < NUM_SLAVES; s++) {
         Wire.beginTransmission(slaveAddresses[s]);
         uint8_t err = Wire.endTransmission(true);
-
-        if (err == 0) {
-            slaveStatus[s].online = true;
-            LOG_INFOF("Escravo %d (0x%02X): ONLINE", s + 1, slaveAddresses[s]);
-        } else {
-            slaveStatus[s].online = false;
-            LOG_WARNF("Escravo %d (0x%02X): OFFLINE (erro %d)", s + 1, slaveAddresses[s], err);
-        }
+        slaveStatus[s].online = (err == 0);
+        if (err == 0) LOG_INFOF("Escravo %d (0x%02X): ONLINE",  s+1, slaveAddresses[s]);
+        else          LOG_WARNF("Escravo %d (0x%02X): OFFLINE (err %d)", s+1, slaveAddresses[s], err);
     }
 
-    LOG_INFO("I2C Slave Manager inicializado!");
+    LOG_INFO("I2C Slave Manager pronto");
 }
+
+// ==================== HANDLE ====================
 
 void I2CSlaveManager::handle() {
     unsigned long now = millis();
@@ -54,160 +71,165 @@ void I2CSlaveManager::handle() {
     }
 }
 
-// ==================== SAÍDAS ====================
+// ==================== API PUBLICA ====================
 
-void I2CSlaveManager::setOutput(uint8_t slaveIndex, uint8_t outputIndex, bool state) {
-    if (slaveIndex >= NUM_SLAVES || outputIndex >= NUM_SLAVE_CHANNELS) return;
-    slaveData[slaveIndex].outputs[outputIndex] = state;
+void I2CSlaveManager::setDesiredOutput(uint8_t s, uint8_t c, bool state) {
+    if (s >= NUM_SLAVES || c >= NUM_SLAVE_CHANNELS) return;
+    slaveData[s].desired[c] = state;
 }
 
-bool I2CSlaveManager::getOutput(uint8_t slaveIndex, uint8_t outputIndex) {
-    if (slaveIndex >= NUM_SLAVES || outputIndex >= NUM_SLAVE_CHANNELS) return false;
-    return slaveData[slaveIndex].outputs[outputIndex];
+bool I2CSlaveManager::getConfirmedOutput(uint8_t s, uint8_t c) const {
+    if (s >= NUM_SLAVES || c >= NUM_SLAVE_CHANNELS) return false;
+    return slaveData[s].confirmed[c];
 }
 
-// ==================== ENTRADAS ====================
-
-bool I2CSlaveManager::getInput(uint8_t slaveIndex, uint8_t inputIndex) {
-    if (slaveIndex >= NUM_SLAVES || inputIndex >= NUM_SLAVE_CHANNELS) return false;
-    return slaveData[slaveIndex].inputs[inputIndex];
+bool I2CSlaveManager::getInput(uint8_t s, uint8_t c) const {
+    if (s >= NUM_SLAVES || c >= NUM_SLAVE_CHANNELS) return false;
+    return slaveData[s].inputs[c];
 }
 
-// ==================== STATUS ====================
-
-bool I2CSlaveManager::isSlaveOnline(uint8_t slaveIndex) {
-    if (slaveIndex >= NUM_SLAVES) return false;
-    return slaveStatus[slaveIndex].online;
+bool I2CSlaveManager::isSlaveOnline(uint8_t s) const {
+    return (s < NUM_SLAVES) && slaveStatus[s].online;
 }
 
-SlaveStatus I2CSlaveManager::getSlaveStatus(uint8_t slaveIndex) {
-    if (slaveIndex >= NUM_SLAVES) return SlaveStatus{false, 0, 0, 0};
-    return slaveStatus[slaveIndex];
+SlaveStatus I2CSlaveManager::getSlaveStatus(uint8_t s) const {
+    if (s >= NUM_SLAVES) return { false, 0, 0, 0 };
+    return slaveStatus[s];
 }
 
-void I2CSlaveManager::setInputChangedCallback(SlaveInputChangedCallback cb) {
-    inputChangedCb = cb;
+void I2CSlaveManager::pushConfig(uint8_t s, const SlaveChannelConfig cfg[NUM_SLAVE_CHANNELS]) {
+    if (s >= NUM_SLAVES) return;
+    for (uint8_t c = 0; c < NUM_SLAVE_CHANNELS; c++) slaveConfig[s][c] = cfg[c];
+    pendingConfigPush[s] = true;
+    LOG_INFOF("Config agendada para escravo %d", s+1);
 }
 
-// ==================== CONFIG PUSH ====================
+// ==================== COMUNICACAO INTERNA ====================
 
-void I2CSlaveManager::pushConfig(uint8_t slaveIndex,
-                                  const SlaveChannelConfig cfg[NUM_SLAVE_CHANNELS]) {
-    if (slaveIndex >= NUM_SLAVES) return;
+bool I2CSlaveManager::communicateWithSlave(uint8_t s) {
+    bool prevInputs   [NUM_SLAVE_CHANNELS];
+    bool prevConfirmed[NUM_SLAVE_CHANNELS];
+    bool wasOnline = slaveStatus[s].online;
 
-    for (uint8_t i = 0; i < NUM_SLAVE_CHANNELS; i++) {
-        slaveConfig[slaveIndex][i] = cfg[i];
-    }
-    pendingConfigPush[slaveIndex] = true;
-
-    LOG_INFOF("Config agendada para escravo %d (sera enviada no proximo ciclo I2C)", slaveIndex + 1);
-}
-
-// ==================== COMUNICAÇÃO ====================
-
-bool I2CSlaveManager::communicateWithSlave(uint8_t slaveIndex) {
-    bool previousInputs[NUM_SLAVE_CHANNELS];
-    for (uint8_t i = 0; i < NUM_SLAVE_CHANNELS; i++) {
-        previousInputs[i] = slaveData[slaveIndex].inputs[i];
+    for (uint8_t c = 0; c < NUM_SLAVE_CHANNELS; c++) {
+        prevInputs   [c] = slaveData[s].inputs   [c];
+        prevConfirmed[c] = slaveData[s].confirmed[c];
     }
 
-    if (!sendOutputsJson(slaveIndex)) {
-        slaveStatus[slaveIndex].errorCount++;
-        slaveStatus[slaveIndex].totalErrors++;
-        if (slaveStatus[slaveIndex].errorCount >= 5) {
-            if (slaveStatus[slaveIndex].online) {
-                LOG_WARNF("Escravo %d offline (falhas consecutivas)", slaveIndex + 1);
+    if (!sendOutputsJson(s)) {
+        slaveStatus[s].errorCount++;
+        slaveStatus[s].totalErrors++;
+        if (slaveStatus[s].errorCount >= 5 && slaveStatus[s].online) {
+            slaveStatus[s].online = false;
+            LOG_WARNF("Escravo %d OFFLINE (falhas consecutivas)", s+1);
+        }
+        return false;
+    }
+
+    if (!receiveStateJson(s)) {
+        slaveStatus[s].errorCount++;
+        slaveStatus[s].totalErrors++;
+        return false;
+    }
+
+    // Escravo voltou online — reagenda cfg para garantir que ele
+    // receba a configuração atual (pode ter reiniciado com defaults)
+    bool justCameOnline = !wasOnline && slaveStatus[s].errorCount > 0;
+    slaveStatus[s].online      = true;
+    slaveStatus[s].lastContact = millis();
+    slaveStatus[s].errorCount  = 0;
+
+    if (justCameOnline) {
+        LOG_INFOF("Escravo %d voltou ONLINE — reenviando cfg", s+1);
+        pendingConfigPush[s] = true;
+    }
+
+    detectChanges(s, prevInputs, prevConfirmed);
+    return true;
+}
+
+// TX: envia desired[c] + cfg se pendente
+// pendingConfigPush so e limpo apos confirmacao de envio bem-sucedido
+bool I2CSlaveManager::sendOutputsJson(uint8_t s) {
+    JsonDocument doc;
+
+    for (uint8_t c = 0; c < NUM_SLAVE_CHANNELS; c++) {
+        doc["do" + String(c + 1)] = slaveData[s].desired[c] ? 1 : 0;
+    }
+
+    bool hasCfg = pendingConfigPush[s];
+    if (hasCfg) {
+        JsonObject cfg = doc["cfg"].to<JsonObject>();
+        for (uint8_t c = 0; c < NUM_SLAVE_CHANNELS; c++) {
+            JsonObject ch = cfg["in" + String(c + 1)].to<JsonObject>();
+            ch["mode"]  = slaveConfig[s][c].mode;
+            ch["deb"]   = slaveConfig[s][c].debMs;
+            ch["pulse"] = slaveConfig[s][c].pulseMs;
+        }
+        LOG_INFOF("Escravo %d: enviando estados + cfg", s+1);
+    }
+
+    String payload;
+    serializeJson(doc, payload);
+
+    Wire.beginTransmission(slaveAddresses[s]);
+    Wire.print(payload);
+    bool ok = (Wire.endTransmission(true) == 0);
+
+    // Limpa flag SO SE o envio foi confirmado pelo ACK do escravo.
+    // Se falhou, mantém true para reenviar no proximo ciclo.
+    if (ok && hasCfg) pendingConfigPush[s] = false;
+
+    return ok;
+}
+
+// RX: le di1-di8 e do1-do8
+bool I2CSlaveManager::receiveStateJson(uint8_t s) {
+    if (!Wire.requestFrom(slaveAddresses[s], (uint8_t)192)) return false;
+
+    String data;
+    unsigned long deadline = millis() + I2C_TIMEOUT_MS;
+    while (Wire.available() && millis() < deadline) data += (char)Wire.read();
+
+    if (data.isEmpty()) return false;
+
+    JsonDocument doc;
+    if (deserializeJson(doc, data) != DeserializationError::Ok) {
+        LOG_WARNF("Escravo %d: JSON invalido", s+1);
+        return false;
+    }
+
+    for (uint8_t c = 0; c < NUM_SLAVE_CHANNELS; c++) {
+        String diKey = "di" + String(c + 1);
+        String doKey = "do" + String(c + 1);
+
+        if (doc[diKey].is<int>())
+            slaveData[s].inputs[c] = doc[diKey].as<int>() != 0;
+
+        if (doc[doKey].is<int>())
+            slaveData[s].confirmed[c] = doc[doKey].as<int>() != 0;
+    }
+
+    return true;
+}
+
+// Detecta mudancas e dispara callbacks
+void I2CSlaveManager::detectChanges(uint8_t s,
+                                     bool prevInputs   [NUM_SLAVE_CHANNELS],
+                                     bool prevConfirmed[NUM_SLAVE_CHANNELS]) {
+    for (uint8_t c = 0; c < NUM_SLAVE_CHANNELS; c++) {
+
+        if (inputChangedCb && slaveData[s].inputs[c] != prevInputs[c]) {
+            inputChangedCb(s, c, slaveData[s].inputs[c]);
+        }
+
+        if (slaveData[s].confirmed[c] != prevConfirmed[c]) {
+            // Atualiza desired para acompanhar o escravo
+            slaveData[s].desired[c] = slaveData[s].confirmed[c];
+
+            if (outputChangedCb) {
+                outputChangedCb(s, c, slaveData[s].confirmed[c]);
             }
-            slaveStatus[slaveIndex].online = false;
-        }
-        return false;
-    }
-
-    if (!receiveInputsJson(slaveIndex)) {
-        slaveStatus[slaveIndex].errorCount++;
-        slaveStatus[slaveIndex].totalErrors++;
-        return false;
-    }
-
-    if (!slaveStatus[slaveIndex].online) {
-        LOG_INFOF("Escravo %d voltou online!", slaveIndex + 1);
-    }
-    slaveStatus[slaveIndex].online      = true;
-    slaveStatus[slaveIndex].lastContact = millis();
-    slaveStatus[slaveIndex].errorCount  = 0;
-
-    detectInputChanges(slaveIndex, previousInputs);
-    return true;
-}
-
-bool I2CSlaveManager::sendOutputsJson(uint8_t slaveIndex) {
-    // Documento maior quando há cfg pendente (com cfg ~420 bytes, sem cfg ~80 bytes)
-    StaticJsonDocument<1024> doc;
-
-    for (uint8_t i = 0; i < NUM_SLAVE_CHANNELS; i++) {
-        doc["do" + String(i + 1)] = slaveData[slaveIndex].outputs[i] ? 1 : 0;
-    }
-
-    // Embute campo "cfg" apenas quando há push pendente
-    if (pendingConfigPush[slaveIndex]) {
-        JsonObject cfg = doc.createNestedObject("cfg");
-        for (uint8_t i = 0; i < NUM_SLAVE_CHANNELS; i++) {
-            JsonObject ch = cfg.createNestedObject("in" + String(i + 1));
-            ch["mode"]  = slaveConfig[slaveIndex][i].mode;
-            ch["deb"]   = slaveConfig[slaveIndex][i].debMs;
-            ch["pulse"] = slaveConfig[slaveIndex][i].pulseMs;
-        }
-        pendingConfigPush[slaveIndex] = false;  // limpa flag após incluir no JSON
-
-        LOG_INFOF("Escravo %d: enviando estados + cfg completa", slaveIndex + 1);
-    }
-
-    String output;
-    serializeJson(doc, output);
-
-    Wire.beginTransmission(slaveAddresses[slaveIndex]);
-    Wire.print(output);  // sem \r\n — o escravo identifica pelo '{'
-    uint8_t err = Wire.endTransmission(true);
-
-    return (err == 0);
-}
-
-bool I2CSlaveManager::receiveInputsJson(uint8_t slaveIndex) {
-    uint8_t bytesReceived = Wire.requestFrom(slaveAddresses[slaveIndex], (uint8_t)128);
-    if (!bytesReceived) return false;
-
-    String data = "";
-    unsigned long timeout = millis() + I2C_TIMEOUT_MS;
-    while (Wire.available() && millis() < timeout) {
-        data += (char)Wire.read();
-    }
-
-    if (data.length() == 0) return false;
-
-    StaticJsonDocument<300> doc;
-    DeserializationError err = deserializeJson(doc, data);
-    if (err) {
-        LOG_WARNF("Escravo %d: erro JSON (%s)", slaveIndex + 1, err.c_str());
-        return false;
-    }
-
-    for (uint8_t i = 0; i < NUM_SLAVE_CHANNELS; i++) {
-        String key = "di" + String(i + 1);
-        if (doc.containsKey(key)) {
-            slaveData[slaveIndex].inputs[i] = doc[key].as<int>() != 0;
-        }
-    }
-
-    return true;
-}
-
-void I2CSlaveManager::detectInputChanges(uint8_t slaveIndex,
-                                          bool previousInputs[NUM_SLAVE_CHANNELS]) {
-    if (!inputChangedCb) return;
-
-    for (uint8_t i = 0; i < NUM_SLAVE_CHANNELS; i++) {
-        if (slaveData[slaveIndex].inputs[i] != previousInputs[i]) {
-            inputChangedCb(slaveIndex, i, slaveData[slaveIndex].inputs[i]);
         }
     }
 }

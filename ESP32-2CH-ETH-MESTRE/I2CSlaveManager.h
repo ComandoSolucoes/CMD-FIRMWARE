@@ -7,14 +7,14 @@
 #include "Config.h"
 
 // ==================== CONFIG DE CANAL DO ESCRAVO ====================
-// Espelha o ChannelConfig do firmware 8CH-IO
+
 struct SlaveChannelConfig {
     uint8_t  mode    = INPUT_MODE_TRANSITION;
     uint16_t debMs   = DEFAULT_DEBOUNCE_MS;
     uint16_t pulseMs = DEFAULT_PULSE_MS;
 };
 
-// ==================== STATUS / DADOS DO ESCRAVO ====================
+// ==================== STATUS ====================
 
 struct SlaveStatus {
     bool          online;
@@ -23,12 +23,23 @@ struct SlaveStatus {
     uint32_t      totalErrors;
 };
 
+// ==================== DADOS DO ESCRAVO ====================
+// desired  = o que o mestre QUER enviar ao escravo
+// confirmed = o que o escravo REPORTOU (fonte da verdade)
+// inputs   = entradas digitais do escravo
+
 struct SlaveData {
-    bool outputs[NUM_SLAVE_CHANNELS]; // do1-do8 (enviamos)
-    bool inputs [NUM_SLAVE_CHANNELS]; // di1-di8 (recebemos)
+    bool desired  [NUM_SLAVE_CHANNELS];
+    bool confirmed[NUM_SLAVE_CHANNELS];
+    bool inputs   [NUM_SLAVE_CHANNELS];
 };
 
-typedef std::function<void(uint8_t slaveIndex, uint8_t inputIndex, bool state)> SlaveInputChangedCallback;
+// ==================== CALLBACKS ====================
+
+// Disparado quando escravo muda saída localmente (botão físico)
+// → NÃO disparado quando mestre confirma seu próprio comando
+typedef std::function<void(uint8_t slaveIndex, uint8_t channelIndex, bool state)> SlaveOutputChangedCallback;
+typedef std::function<void(uint8_t slaveIndex, uint8_t channelIndex, bool state)> SlaveInputChangedCallback;
 
 // ==================== CLASSE ====================
 
@@ -39,23 +50,26 @@ public:
     void begin();
     void handle();
 
-    // Saídas
-    void setOutput(uint8_t slaveIndex, uint8_t outputIndex, bool state);
-    bool getOutput(uint8_t slaveIndex, uint8_t outputIndex);
+    // ── Saídas ──────────────────────────────────────────────
+    // setDesiredOutput: mestre quer mudar estado → vai no TX
+    void setDesiredOutput(uint8_t slaveIndex, uint8_t ch, bool state);
 
-    // Entradas
-    bool getInput(uint8_t slaveIndex, uint8_t inputIndex);
+    // getConfirmedOutput: último estado confirmado pelo escravo (verdade)
+    bool getConfirmedOutput(uint8_t slaveIndex, uint8_t ch) const;
 
-    // Status
-    bool        isSlaveOnline(uint8_t slaveIndex);
-    SlaveStatus getSlaveStatus(uint8_t slaveIndex);
+    // ── Entradas ─────────────────────────────────────────────
+    bool getInput(uint8_t slaveIndex, uint8_t ch) const;
 
-    // Callback
-    void setInputChangedCallback(SlaveInputChangedCallback cb);
+    // ── Status ───────────────────────────────────────────────
+    bool        isSlaveOnline(uint8_t slaveIndex) const;
+    SlaveStatus getSlaveStatus(uint8_t slaveIndex) const;
 
-    // ==================== CONFIG PUSH ====================
-    // Agenda envio de configuração completa embutida no próximo JSON de saídas.
-    // Chamado pelo IOManager no boot e ao salvar configuração.
+    // ── Callbacks ────────────────────────────────────────────
+    void setOutputChangedCallback(SlaveOutputChangedCallback cb) { outputChangedCb = cb; }
+    void setInputChangedCallback (SlaveInputChangedCallback  cb) { inputChangedCb  = cb; }
+
+    // ── Config push ──────────────────────────────────────────
+    // Agenda envio de config completa embutida no próximo ciclo I2C
     void pushConfig(uint8_t slaveIndex, const SlaveChannelConfig cfg[NUM_SLAVE_CHANNELS]);
 
 private:
@@ -63,18 +77,20 @@ private:
     SlaveStatus slaveStatus[NUM_SLAVES];
     unsigned long lastPollTime;
 
-    SlaveInputChangedCallback inputChangedCb;
-
-    // Config pendente para cada escravo
     bool               pendingConfigPush[NUM_SLAVES];
     SlaveChannelConfig slaveConfig[NUM_SLAVES][NUM_SLAVE_CHANNELS];
+
+    SlaveOutputChangedCallback outputChangedCb;
+    SlaveInputChangedCallback  inputChangedCb;
 
     const uint8_t slaveAddresses[NUM_SLAVES] = { I2C_SLAVE1_ADDR, I2C_SLAVE2_ADDR };
 
     bool communicateWithSlave(uint8_t slaveIndex);
     bool sendOutputsJson(uint8_t slaveIndex);
-    bool receiveInputsJson(uint8_t slaveIndex);
-    void detectInputChanges(uint8_t slaveIndex, bool previousInputs[NUM_SLAVE_CHANNELS]);
+    bool receiveStateJson(uint8_t slaveIndex);
+    void detectChanges(uint8_t slaveIndex,
+                       bool prevInputs [NUM_SLAVE_CHANNELS],
+                       bool prevConfirmed[NUM_SLAVE_CHANNELS]);
 };
 
 #endif // I2C_SLAVE_MANAGER_H

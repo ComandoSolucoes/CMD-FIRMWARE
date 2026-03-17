@@ -17,60 +17,59 @@ public:
     void begin();
     void handle();
 
-    // Saídas
+    // ── Saídas (índice global 0-17) ──────────────────────────
     void setOutput(uint8_t index, bool state);
     void toggleOutput(uint8_t index);
-    bool getOutputState(uint8_t index);
+    bool getOutputState(uint8_t index) const;
     void setAllOutputs(bool state);
 
-    // Entradas
-    bool getInputState(uint8_t index);
+    // ── Entradas (índice global 0-17) ────────────────────────
+    bool getInputState(uint8_t index) const;
 
-    // Configuração geral
-    void         setRelayLogic(RelayLogic logic);
-    RelayLogic   getRelayLogic()   const { return relayLogic; }
+    // ── Config geral ─────────────────────────────────────────
+    void         setRelayLogic  (RelayLogic   logic);
+    RelayLogic   getRelayLogic  () const { return relayLogic;   }
     void         setInitialState(InitialState is);
     InitialState getInitialState() const { return initialState; }
 
-    // Config por canal de entrada (índice global 0-17)
-    void      setInputMode(uint8_t index, InputMode mode);
-    InputMode getInputMode(uint8_t index);
+    // ── Config por canal de entrada (0-17) ───────────────────
+    void      setInputMode   (uint8_t index, InputMode mode);
+    InputMode getInputMode   (uint8_t index) const;
+    void      setDebounceTime(uint8_t index, uint16_t ms);
+    uint16_t  getDebounceTime(uint8_t index) const;
+    void      setPulseTime   (uint8_t index, uint16_t ms);
+    uint16_t  getPulseTime   (uint8_t index) const;
 
-    void     setDebounceTime(uint8_t index, uint16_t ms);
-    uint16_t getDebounceTime(uint8_t index);
-
-    // Tempo de pulso — indexado por canal de ENTRADA (0-17)
-    // Locais (0-1): timer do mestre | Escravos (2-17): enviado via cfg I2C
-    void     setPulseTime(uint8_t index, uint16_t ms);
-    uint16_t getPulseTime(uint8_t index);
-
-    // Callbacks
+    // ── Callbacks ────────────────────────────────────────────
     void setOutputChangedCallback(OutputChangedCallback cb) { onOutputChanged = cb; }
     void setInputChangedCallback (InputChangedCallback  cb) { onInputChanged  = cb; }
 
-    // Persistência
+    // ── Persistência ─────────────────────────────────────────
     void saveConfig();
     void loadConfig();
 
-    // Envia config atual de todos os escravos via I2C (boot + save config)
+    // ── Push de config I2C (boot + save) ─────────────────────
     void pushSlavesConfig();
 
 private:
     I2CSlaveManager* slaves;
 
+    // outputStates[0-1]  = saídas locais (hardware direto)
+    // outputStates[2-17] = espelho de confirmed[] dos escravos
     bool     outputStates[NUM_TOTAL_OUTPUTS];
     bool     inputStates [NUM_TOTAL_INPUTS];
-    bool     lastInputRaw[NUM_LOCAL_INPUTS];  // debounce só nas entradas locais
 
+    // Debounce das entradas locais
+    bool     lastInputRaw [NUM_LOCAL_INPUTS];
     uint32_t debounceTimer[NUM_LOCAL_INPUTS];
-    uint32_t pulseTimer   [NUM_LOCAL_INPUTS]; // pulso das entradas locais
+    uint32_t pulseTimer   [NUM_LOCAL_INPUTS];
 
     RelayLogic   relayLogic;
     InitialState initialState;
 
     InputMode inputMode [NUM_TOTAL_INPUTS];
     uint16_t  debounceMs[NUM_TOTAL_INPUTS];
-    uint16_t  pulseMs   [NUM_TOTAL_INPUTS]; // armazenado para todos; escravos recebem via cfg
+    uint16_t  pulseMs   [NUM_TOTAL_INPUTS];
 
     OutputChangedCallback onOutputChanged;
     InputChangedCallback  onInputChanged;
@@ -83,7 +82,10 @@ private:
     void applyInitialState();
     void applyOutputHardware(uint8_t index, bool state);
     bool readLocalInput(uint8_t index) const;
-    void processInput(uint8_t index, bool rawState);
+    void processLocalInput(uint8_t index, bool rawState);
+
+    // Converte índice global → (slaveIndex, channelIndex)
+    void globalToSlave(uint8_t globalIndex, uint8_t& si, uint8_t& ci) const;
 };
 
 #endif // IO_MANAGER_ETH18_H
